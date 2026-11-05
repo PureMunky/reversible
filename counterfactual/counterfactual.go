@@ -71,6 +71,9 @@ type Plan struct {
 	Goal    string          `json:"goal,omitempty"`
 	Effects []PlannedEffect `json:"effects"`
 	Err     string          `json:"error,omitempty"`
+	// Predicted is what simulators expect the world to do in response, as
+	// metric deltas summed over the plan's effects (nil without simulators).
+	Predicted map[string]float64 `json:"predicted,omitempty"`
 }
 
 // Irreversible lists the plan's irreversible effects.
@@ -139,6 +142,8 @@ type Diff struct {
 	// baseline did not.
 	NewIrreversible []PlannedEffect
 	NewError        string
+	// MetricDelta is candidate minus baseline predicted metrics.
+	MetricDelta map[string]float64
 }
 
 // Same reports whether the candidate behaves exactly like the baseline.
@@ -167,7 +172,8 @@ type Report struct {
 	CandidateErrors int
 	NewViolations   int
 	NewIrreversible int
-	Diffs           []Diff // only requests where something differed or was flagged
+	Diffs           []Diff         // only requests where something differed or was flagged
+	Metrics         []MetricChange // predicted totals, when simulators are configured
 	Blockers        []string
 }
 
@@ -177,10 +183,38 @@ func (r Report) Promote() bool { return len(r.Blockers) == 0 }
 // Replay runs every request through baseline and candidate with all effects
 // intercepted, and reports what would have changed.
 func Replay(ctx context.Context, reqs []Request, baseline, candidate Program, invariants []Invariant, pol Policy) Report {
+	return ReplayWith(ctx, Config{Requests: reqs, Baseline: baseline, Candidate: candidate, Invariants: invariants, Policy: pol})
+}
+
+// Config is the full set of inputs to ReplayWith.
+type Config struct {
+	Requests   []Request
+	Baseline   Program
+	Candidate  Program
+	Invariants []Invariant
+	Policy     Policy
+	// Simulators predict how the world responds to each effect type, so
+	// the report can show consequences (revenue, churn) and not only plans.
+	Simulators Simulators
+	// Guardrails block promotion when predicted totals move too far.
+	Guardrails []Guardrail
+}
+
+// ReplayWith is Replay with simulators and guardrails.
+func ReplayWith(ctx context.Context, cfg Config) Report {
+	reqs, baseline, candidate, invariants, pol := cfg.Requests, cfg.Baseline, cfg.Candidate, cfg.Invariants, cfg.Policy
 	rep := Report{Total: len(reqs)}
+	baseTotals, candTotals := map[string]float64{}, map[string]float64{}
 	for _, req := range reqs {
 		d := Diff{Request: req, Baseline: Simulate(ctx, baseline, req), Candidate: Simulate(ctx, candidate, req)}
 		diffEffects(&d)
+		if cfg.Simulators != nil {
+			cfg.Simulators.predict(req, &d.Baseline)
+			cfg.Simulators.predict(req, &d.Candidate)
+			d.MetricDelta = delta(d.Baseline.Predicted, d.Candidate.Predicted)
+			addInto(baseTotals, d.Baseline.Predicted)
+			addInto(candTotals, d.Candidate.Predicted)
+		}
 
 		baseViol := violations(req, d.Baseline, invariants)
 		for v := range violations(req, d.Candidate, invariants) {
@@ -239,6 +273,14 @@ func Replay(ctx context.Context, reqs []Request, baseline, candidate Program, in
 			rep.Blockers = append(rep.Blockers, fmt.Sprintf("candidate changes %.0f%% of requests (limit %.0f%%)", frac*100, pol.MaxChangedFraction*100))
 		}
 	}
+	if cfg.Simulators != nil {
+		rep.Metrics = metricChanges(baseTotals, candTotals)
+		for _, g := range cfg.Guardrails {
+			if msg := g.check(rep.Metrics); msg != "" {
+				rep.Blockers = append(rep.Blockers, msg)
+			}
+		}
+	}
 	return rep
 }
 
@@ -268,6 +310,15 @@ func (r Report) String() string {
 		}
 		for _, v := range d.Inherited {
 			fmt.Fprintf(&b, "    · already violated by baseline: %s\n", v)
+		}
+		if line := formatDelta(d.MetricDelta); line != "" {
+			fmt.Fprintf(&b, "    Δ %s\n", line)
+		}
+	}
+	if len(r.Metrics) > 0 {
+		b.WriteString("predicted impact:\n")
+		for _, m := range r.Metrics {
+			fmt.Fprintf(&b, "  %-14s %10.4g → %-10.4g %s\n", m.Metric, m.Baseline, m.Candidate, m.change())
 		}
 	}
 	if r.Promote() {
