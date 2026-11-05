@@ -30,6 +30,7 @@ jobs:
           grep -q "promoted \$52 over \$55" evo.txt
           grep -q "customers on \$65 after auto-rewind: 0" evo.txt
           grep -q "chain verifies" evo.txt
+          grep -q "rejected by the calibrated gate" evo.txt
       - name: crash-recovery smoke test
         run: |
           go build -o agentctl ./cmd/agentctl

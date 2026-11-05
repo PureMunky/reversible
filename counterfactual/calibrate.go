@@ -53,9 +53,15 @@ type Correction struct {
 	Metric           string
 	N                int
 	Intercept, Slope float64
-	// MAEBefore and MAEAfter are the mean absolute error of raw and
-	// corrected predictions on the data the correction was fitted to.
-	MAEBefore, MAEAfter float64
+	// SlopeLearned is false when the data couldn't distinguish the slope
+	// from the model's own, so only a level shift is applied.
+	SlopeLearned bool
+	// Lo and Hi are the range of predictions the correction was fitted on.
+	Lo, Hi float64
+	// RMSEBefore and RMSEAfter are the root-mean-square error of raw and
+	// corrected predictions on the data the correction was fitted to
+	// (least squares minimises exactly this).
+	RMSEBefore, RMSEAfter float64
 }
 
 // Calibration is a fitted set of corrections, ready to apply.
@@ -77,31 +83,52 @@ func (c *Calibrator) Fit() *Calibration {
 		if len(ps) < min {
 			continue
 		}
-		var sx, sy, sxx, sxy float64
-		for _, p := range ps {
-			sx += p[0]
-			sy += p[1]
-			sxx += p[0] * p[0]
-			sxy += p[0] * p[1]
-		}
 		n := float64(len(ps))
-		corr := Correction{Metric: m, N: len(ps), Slope: 1}
-		if den := n*sxx - sx*sx; math.Abs(den) > 1e-12 {
-			corr.Slope = (n*sxy - sx*sy) / den
-			corr.Intercept = (sy - corr.Slope*sx) / n
-		} else {
-			// All predictions identical: only a shift can be learned.
-			corr.Intercept = (sy - sx) / n
+		var mx, my float64
+		lo, hi := math.Inf(1), math.Inf(-1)
+		for _, p := range ps {
+			mx += p[0]
+			my += p[1]
+			lo, hi = math.Min(lo, p[0]), math.Max(hi, p[0])
+		}
+		mx /= n
+		my /= n
+		var sxx, sxy float64
+		for _, p := range ps {
+			sxx += (p[0] - mx) * (p[0] - mx)
+			sxy += (p[0] - mx) * (p[1] - my)
+		}
+		// Default: a pure level shift, keeping the model's own slope.
+		corr := Correction{Metric: m, N: len(ps), Slope: 1, Intercept: my - mx, Lo: lo, Hi: hi}
+		if sxx > 1e-12 && len(ps) > 2 {
+			slope := sxy / sxx
+			var ssr float64
+			for _, p := range ps {
+				r := p[1] - (my + slope*(p[0]-mx))
+				ssr += r * r
+			}
+			se := math.Sqrt(ssr / (n - 2) / sxx)
+			if se == 0 || math.Abs(slope-1)/se >= 2 {
+				corr.Slope, corr.Intercept, corr.SlopeLearned = slope, my-slope*mx, true
+			}
 		}
 		for _, p := range ps {
-			corr.MAEBefore += math.Abs(p[0] - p[1])
-			corr.MAEAfter += math.Abs(cal.clamp(m, corr.Intercept+corr.Slope*p[0]) - p[1])
+			before, after := p[0]-p[1], cal.clamp(m, corr.at(p[0]))-p[1]
+			corr.RMSEBefore += before * before
+			corr.RMSEAfter += after * after
 		}
-		corr.MAEBefore /= n
-		corr.MAEAfter /= n
+		corr.RMSEBefore = math.Sqrt(corr.RMSEBefore / n)
+		corr.RMSEAfter = math.Sqrt(corr.RMSEAfter / n)
 		cal.Corrections[m] = corr
 	}
 	return cal
+}
+
+// at applies the correction without extrapolating it: beyond the fitted
+// range, the edge correction is held and the raw model's slope continues.
+func (c Correction) at(x float64) float64 {
+	edge := math.Max(c.Lo, math.Min(c.Hi, x))
+	return c.Intercept + c.Slope*edge + (x - edge)
 }
 
 func (cal *Calibration) clamp(m string, v float64) float64 {
@@ -120,7 +147,7 @@ func (cal *Calibration) apply(pred map[string]float64) {
 	}
 	for m, v := range pred {
 		if c, ok := cal.Corrections[m]; ok {
-			pred[m] = cal.clamp(m, c.Intercept+c.Slope*v)
+			pred[m] = cal.clamp(m, c.at(v))
 		}
 	}
 }
@@ -138,8 +165,13 @@ func (cal *Calibration) String() string {
 	var b strings.Builder
 	for _, m := range names {
 		c := cal.Corrections[m]
-		fmt.Fprintf(&b, "%-10s n=%-5d observed ≈ %.3g + %.3g × predicted   mean error %.3g → %.3g\n",
-			m, c.N, c.Intercept, c.Slope, c.MAEBefore, c.MAEAfter)
+		how := "level shift only (slope not distinguishable from the model's)"
+		if c.SlopeLearned {
+			how = fmt.Sprintf("observed ≈ %.3g + %.3g × predicted", c.Intercept, c.Slope)
+		} else {
+			how = fmt.Sprintf("observed ≈ predicted %+.3g; %s", c.Intercept, how)
+		}
+		fmt.Fprintf(&b, "%-8s n=%-6d %s, error (RMSE) %.3g → %.3g\n", m, c.N, how, c.RMSEBefore, c.RMSEAfter)
 	}
 	return b.String()
 }

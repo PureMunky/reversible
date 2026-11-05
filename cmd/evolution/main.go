@@ -80,8 +80,10 @@ func registry(w *world) *reversible.Registry {
 // customer traits, derived deterministically from the ID
 func hash(s string) uint64 { h := fnv.New64a(); h.Write([]byte(s)); return h.Sum64() }
 
-// sensitivity is what the business *thinks* it knows (it feeds the simulator).
-func sensitivity(c string) float64 { return 0.5 + float64(hash(c)%100)/100 }
+// sensitivity is what the business *thinks* it knows (it feeds the
+// simulator). The model gets the direction right (higher price, more churn)
+// but badly underestimates the size of the effect.
+func sensitivity(c string) float64 { return 0.9 + float64(hash(c)%20)/100 }
 
 // threshold is the truth: the price above which this customer actually leaves.
 func threshold(c string) int { return 50 + int(hash(c+"#")%40) }
@@ -179,6 +181,8 @@ func main() {
 
 	// ── 3. Population: champion serves, traffic is recorded ───────────────
 	rt := reversible.New(reversible.WithRegistry(reg))
+	calibrator := counterfactual.NewCalibrator()
+	calibrator.Bounds = map[string][2]float64{"churn": {0, 1}}
 	champion := variant{name: "$55", price: 55}
 	pop, err := evolve.New(evolve.Variant{Name: champion.name, Program: champion.program(reg), Decision: "price-55"}, evolve.Options{
 		Gate:            compiled.Config(counterfactual.Config{Simulators: simulators}),
@@ -187,6 +191,7 @@ func main() {
 		Objective:       evolve.Objective{Metric: "revenue", Maximize: true, MinLiftPct: 2},
 		Guardrails:      compiled.Guardrails,
 		MinSamples:      60,
+		Calibrator:      calibrator,
 		Ledger:          g, AutoRewind: true, Undoer: rt, Actor: "evolve",
 	})
 	check(err)
@@ -243,7 +248,7 @@ func main() {
 	}
 	fmt.Printf("   customers currently on $65: %d\n", held)
 
-	head("5 · Evaluate: outcomes decide")
+	head("5 · Evaluate: outcomes decide, but only with evidence")
 	verdict, err := pop.Evaluate(ctx)
 	check(err)
 	fmt.Print(indent(verdict.String()))
@@ -254,11 +259,34 @@ func main() {
 		}
 	}
 	fmt.Printf("   customers on $65 after auto-rewind: %d   (their charges and receipts were never released)\n", held)
-	fmt.Printf("   champion is now %s\n", pop.Champion().Name)
 	fmt.Println("   the simulator predicted $65 was safe; reality disagreed, and reality won")
+	fmt.Println("   $52 looks better, but a +2.7% edge on 131 customers could be luck, so it keeps running")
 
-	// ── 6. Accountability ─────────────────────────────────────────────────
-	head("6 · Anyone with the public keys can verify who decided what")
+	head("6 · More customers arrive until the data is conclusive")
+	for round := 1; round <= 20 && verdict.Promoted == "" && len(verdict.Waiting) > 0; round++ {
+		serve(1000)
+		verdict, err = pop.Evaluate(ctx)
+		check(err)
+		for _, w := range verdict.Waiting {
+			fmt.Printf("   +%5d customers: %s\n", round*1000, w.Note)
+		}
+	}
+	fmt.Print(indent(verdict.String()))
+	fmt.Printf("   champion is now %s\n", pop.Champion().Name)
+
+	head("7 · Meanwhile the simulator has been learning from every outcome")
+	fmt.Print(indent(pop.Calibration().String()))
+	decide("try-65-again", "try $65 again", "the original model said it was safe")
+	rep, err := pop.Propose(ctx, evolve.Variant{Name: "$65 again", Program: variant{price: 65}.program(reg), Decision: "try-65-again"})
+	check(err)
+	if rep.Promote() {
+		fmt.Println("   ✓ $65 again    admitted")
+	} else {
+		fmt.Printf("   ✗ $65 again    rejected by the calibrated gate: %s\n", rep.Blockers[0])
+	}
+
+	// ── 8. Accountability ─────────────────────────────────────────────────
+	head("8 · Anyone with the public keys can verify who decided what")
 	records, _ := store.Load()
 	signers := map[string]int{}
 	for _, r := range records {

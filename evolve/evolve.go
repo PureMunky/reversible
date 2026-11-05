@@ -65,6 +65,21 @@ type Options struct {
 	// MinSamples is how many observed outcomes each side needs before a
 	// challenger is judged (default 30).
 	MinSamples int
+	// MaxSamples retires a challenger as inconclusive once it has this many
+	// outcomes without a significant result (0 means never).
+	MaxSamples int
+	// Alpha is the overall false-positive budget for promotions and
+	// "worse" verdicts (default 0.05). It is spent across repeated
+	// evaluations, so checking often doesn't inflate it.
+	Alpha float64
+	// GuardrailAlpha is the budget for guardrail breaches (default 0.10):
+	// looser than Alpha, because stopping harm early matters more than
+	// being sure.
+	GuardrailAlpha float64
+	// Calibrator, if set (with Gate.Simulators), receives a prediction for
+	// every served request paired with its observed outcome, and the gate
+	// uses its latest fit for every new proposal.
+	Calibrator *counterfactual.Calibrator
 
 	// Ledger, if set, links served intents to variant decisions and
 	// records evaluation outcomes.
@@ -87,21 +102,35 @@ const (
 )
 
 type stats struct {
-	n    int
-	sums map[string]float64
+	n       int
+	metrics map[string]*welford
+}
+
+func newStats() *stats { return &stats{metrics: map[string]*welford{}} }
+
+func (s *stats) add(m map[string]float64) {
+	s.n++
+	for k, v := range m {
+		w := s.metrics[k]
+		if w == nil {
+			w = &welford{}
+			s.metrics[k] = w
+		}
+		w.add(v)
+	}
 }
 
 func (s *stats) mean(m string) float64 {
-	if s.n == 0 {
-		return 0
+	if w := s.metrics[m]; w != nil {
+		return w.mean
 	}
-	return s.sums[m] / float64(s.n)
+	return 0
 }
 
 func (s *stats) means() map[string]float64 {
 	out := map[string]float64{}
-	for k := range s.sums {
-		out[k] = s.mean(k)
+	for k, w := range s.metrics {
+		out[k] = w.mean
 	}
 	return out
 }
@@ -111,17 +140,19 @@ type entry struct {
 	status Status
 	reason string
 	stats  *stats
+	looks  int // evaluations with enough data, for alpha spending
 }
 
 // Population is a champion and its challengers.
 type Population struct {
-	mu       sync.Mutex
-	opts     Options
-	champion *entry
-	entries  map[string]*entry
-	order    []string
-	served   map[string]string // request ID -> variant name
-	rounds   int
+	mu        sync.Mutex
+	opts      Options
+	champion  *entry
+	entries   map[string]*entry
+	order     []string
+	served    map[string]string             // request ID -> variant name
+	predicted map[string]map[string]float64 // request ID -> raw simulator prediction
+	rounds    int
 }
 
 // New creates a population with an initial champion.
@@ -138,15 +169,21 @@ func New(champion Variant, opts Options) (*Population, error) {
 	if opts.MinSamples == 0 {
 		opts.MinSamples = 30
 	}
+	if opts.Alpha == 0 {
+		opts.Alpha = 0.05
+	}
+	if opts.GuardrailAlpha == 0 {
+		opts.GuardrailAlpha = 0.10
+	}
 	if opts.Objective.Metric == "" {
 		return nil, errors.New("an objective metric is required")
 	}
 	if opts.AutoRewind && (opts.Ledger == nil || opts.Undoer == nil) {
 		return nil, errors.New("AutoRewind needs a Ledger and an Undoer")
 	}
-	e := &entry{v: champion, status: Champion, stats: &stats{sums: map[string]float64{}}}
+	e := &entry{v: champion, status: Champion, stats: newStats()}
 	return &Population{opts: opts, champion: e, entries: map[string]*entry{champion.Name: e},
-		order: []string{champion.Name}, served: map[string]string{}}, nil
+		order: []string{champion.Name}, served: map[string]string{}, predicted: map[string]map[string]float64{}}, nil
 }
 
 // Propose runs a candidate through the replay gate against the current
@@ -176,11 +213,14 @@ func (p *Population) Propose(ctx context.Context, v Variant) (counterfactual.Rep
 	}
 	cfg := p.opts.Gate
 	cfg.Requests, cfg.Baseline, cfg.Candidate = reqs, champ.Program, v.Program
+	if p.opts.Calibrator != nil {
+		cfg.Calibration = p.opts.Calibrator.Fit()
+	}
 	rep := counterfactual.ReplayWith(ctx, cfg)
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	e := &entry{v: v, status: Challenger, stats: &stats{sums: map[string]float64{}}}
+	e := &entry{v: v, status: Challenger, stats: newStats()}
 	if !rep.Promote() {
 		e.status, e.reason = Rejected, strings.Join(rep.Blockers, "; ")
 	}
@@ -240,6 +280,12 @@ func (p *Population) Serve(ctx context.Context, rt *reversible.Runtime, req coun
 	if err != nil {
 		return v, nil, fmt.Errorf("variant %s: %w", v.Name, err)
 	}
+	if p.opts.Calibrator != nil && p.opts.Gate.Simulators != nil {
+		pred := counterfactual.Predict(p.opts.Gate.Simulators, req, counterfactual.PlanOf(in))
+		p.mu.Lock()
+		p.predicted[req.ID] = pred
+		p.mu.Unlock()
+	}
 	if p.opts.Ledger != nil && v.Decision != "" {
 		res, err := p.opts.Ledger.Execute(ctx, rt, v.Decision, in)
 		return v, res, err
@@ -256,23 +302,45 @@ func (p *Population) Observe(requestID string, metrics map[string]float64) error
 	if !ok {
 		return fmt.Errorf("request %q was not served by this population", requestID)
 	}
+	if pred, ok := p.predicted[requestID]; ok {
+		delete(p.predicted, requestID)
+		p.opts.Calibrator.Add(pred, metrics) // reality teaches the model, whoever served
+	}
 	e := p.entries[name]
 	if e.status == Retired || e.status == Rejected {
-		return nil // late outcomes for retired variants don't count
+		return nil // late outcomes for retired variants don't count toward evaluation
 	}
-	e.stats.n++
-	for k, v := range metrics {
-		e.stats.sums[k] += v
-	}
+	e.stats.add(metrics)
 	return nil
 }
+
+// RetireKind says why a challenger was stopped.
+type RetireKind string
+
+const (
+	// Breach: an observed guardrail breach. With AutoRewind, the
+	// challenger's decision is rewound and everything it did is undone.
+	Breach RetireKind = "guardrail breach"
+	// Worse: significantly worse on the objective. Its actions were within
+	// bounds, so they stand; it just stops getting traffic.
+	Worse RetireKind = "worse on objective"
+	// Inconclusive: reached MaxSamples with no significant difference.
+	Inconclusive RetireKind = "inconclusive"
+)
 
 // Retirement is a challenger that was stopped, and what was done about it.
 type Retirement struct {
 	Variant  string
+	Kind     RetireKind
 	Reason   string
-	Decision string                 // the decision to rewind
-	Rewind   *decision.RewindReport // set when AutoRewind ran
+	Decision string                 // the challenger's decision
+	Rewind   *decision.RewindReport // set when AutoRewind ran (breaches only)
+}
+
+// Pending is a challenger still being evaluated.
+type Pending struct {
+	Variant string
+	Note    string
 }
 
 // Verdict is the result of an evaluation round.
@@ -280,29 +348,31 @@ type Verdict struct {
 	Promoted  string // new champion, if any
 	Dethroned string // old champion, if one was replaced
 	Lift      float64
+	P         float64 // p-value behind the promotion
 	Retired   []Retirement
-	Waiting   []string // challengers without enough samples yet
+	Waiting   []Pending
 }
 
 func (v Verdict) String() string {
 	var b strings.Builder
 	if v.Promoted != "" {
-		fmt.Fprintf(&b, "promoted %s over %s (%+.1f%% on objective)\n", v.Promoted, v.Dethroned, v.Lift)
+		fmt.Fprintf(&b, "promoted %s over %s (%+.1f%% on objective, p=%.2g)\n", v.Promoted, v.Dethroned, v.Lift, v.P)
 	}
 	for _, r := range v.Retired {
-		fmt.Fprintf(&b, "retired %s: %s\n", r.Variant, r.Reason)
-		if r.Rewind != nil {
+		fmt.Fprintf(&b, "retired %s (%s): %s\n", r.Variant, r.Kind, r.Reason)
+		switch {
+		case r.Rewind != nil:
 			fmt.Fprintf(&b, "  rewound decision %s: %d intent(s) undone", r.Decision, len(r.Rewind.Undone))
 			if len(r.Rewind.Stranded) > 0 {
 				fmt.Fprintf(&b, ", %d stranded", len(r.Rewind.Stranded))
 			}
 			b.WriteString("\n")
-		} else if r.Decision != "" {
+		case r.Kind == Breach && r.Decision != "":
 			fmt.Fprintf(&b, "  suggest rewinding decision %s\n", r.Decision)
 		}
 	}
 	for _, w := range v.Waiting {
-		fmt.Fprintf(&b, "waiting on %s: not enough outcomes yet\n", w)
+		fmt.Fprintf(&b, "waiting on %s: %s\n", w.Variant, w.Note)
 	}
 	if b.Len() == 0 {
 		return "no challengers\n"
@@ -310,19 +380,29 @@ func (v Verdict) String() string {
 	return b.String()
 }
 
-// Evaluate judges every challenger with enough outcomes. Guardrail breaches
-// retire (and optionally rewind); otherwise the challenger with the best
-// lift past MinLiftPct becomes champion.
+// Evaluate judges every challenger with enough outcomes, in this order:
+//
+//  1. A guardrail whose observed average is breached, significantly
+//     (GuardrailAlpha), retires the challenger and, with AutoRewind,
+//     rewinds its decision.
+//  2. A challenger significantly better on the objective (Alpha), by at
+//     least MinLiftPct, is a promotion candidate; the best one wins.
+//  3. One significantly worse is retired; its actions stand.
+//  4. One at MaxSamples with no significant result is retired.
+//  5. Otherwise it keeps running.
+//
+// Significance uses Welch's t-test, and each challenger's budget is spent
+// across evaluations (alpha/2, alpha/4, ...), so evaluating often is safe.
 func (p *Population) Evaluate(ctx context.Context) (Verdict, error) {
 	p.mu.Lock()
 	p.rounds++
 	round := p.rounds
 	champ := p.champion
+	obj := p.opts.Objective
 	var verdict Verdict
 	type candidate struct {
-		e    *entry
-		lift float64
-		ms   []counterfactual.MetricChange
+		e       *entry
+		lift, p float64
 	}
 	var best *candidate
 	var toRetire []Retirement
@@ -330,10 +410,12 @@ func (p *Population) Evaluate(ctx context.Context) (Verdict, error) {
 
 	for _, e := range p.challengers() {
 		if e.stats.n < p.opts.MinSamples || champ.stats.n < p.opts.MinSamples {
-			verdict.Waiting = append(verdict.Waiting, e.v.Name)
+			verdict.Waiting = append(verdict.Waiting, Pending{e.v.Name,
+				fmt.Sprintf("%d/%d outcomes (champion %d)", e.stats.n, p.opts.MinSamples, champ.stats.n)})
 			continue
 		}
-		ms := compare(champ.stats.means(), e.stats.means())
+		e.looks++
+		alpha, galpha := spend(p.opts.Alpha, e.looks), spend(p.opts.GuardrailAlpha, e.looks)
 		if e.v.Decision != "" {
 			outcomes = append(outcomes, decision.Outcome{
 				ID:      fmt.Sprintf("eval-%d-%s", round, e.v.Name),
@@ -343,27 +425,69 @@ func (p *Population) Evaluate(ctx context.Context) (Verdict, error) {
 				Actor:   p.opts.Actor,
 			})
 		}
-		var breaches []string
+
+		ms := compare(champ.stats.means(), e.stats.means())
+		var breaches, suspected []string
 		for _, g := range p.opts.Guardrails {
-			if msg := g.Check(ms); msg != "" {
-				breaches = append(breaches, strings.Replace(msg, "predicted ", "observed ", 1))
+			msg := g.Check(ms)
+			if msg == "" {
+				continue
+			}
+			msg = strings.Replace(msg, "predicted ", "observed ", 1)
+			var pv float64
+			if g.Rise {
+				pv = pGreater(e.stats.metrics[g.Metric], champ.stats.metrics[g.Metric])
+			} else {
+				pv = pGreater(champ.stats.metrics[g.Metric], e.stats.metrics[g.Metric])
+			}
+			if pv < galpha {
+				breaches = append(breaches, fmt.Sprintf("%s, p=%.2g", msg, pv))
+			} else {
+				suspected = append(suspected, fmt.Sprintf("%s but not yet significant (p=%.2g, need <%.2g)", msg, pv, galpha))
 			}
 		}
 		if len(breaches) > 0 {
 			e.status, e.reason = Retired, strings.Join(breaches, "; ")
-			toRetire = append(toRetire, Retirement{Variant: e.v.Name, Reason: e.reason, Decision: e.v.Decision})
+			toRetire = append(toRetire, Retirement{Variant: e.v.Name, Kind: Breach, Reason: e.reason, Decision: e.v.Decision})
 			continue
 		}
-		lift := liftPct(champ.stats.mean(p.opts.Objective.Metric), e.stats.mean(p.opts.Objective.Metric), p.opts.Objective.Maximize)
-		if lift >= p.opts.Objective.MinLiftPct && (best == nil || lift > best.lift) {
-			best = &candidate{e: e, lift: lift, ms: ms}
+
+		cw, chw := e.stats.metrics[obj.Metric], champ.stats.metrics[obj.Metric]
+		better, worse := pGreater(cw, chw), pGreater(chw, cw)
+		if !obj.Maximize {
+			better, worse = worse, better
+		}
+		lift := liftPct(champ.stats.mean(obj.Metric), e.stats.mean(obj.Metric), obj.Maximize)
+		switch {
+		case len(suspected) == 0 && better < alpha && lift >= obj.MinLiftPct:
+			if best == nil || lift > best.lift {
+				best = &candidate{e: e, lift: lift, p: better}
+			}
+		case worse < alpha:
+			e.status = Retired
+			e.reason = fmt.Sprintf("%s %+.1f%% vs %s, p=%.2g", obj.Metric, lift, champ.v.Name, worse)
+			toRetire = append(toRetire, Retirement{Variant: e.v.Name, Kind: Worse, Reason: e.reason, Decision: e.v.Decision})
+		case p.opts.MaxSamples > 0 && e.stats.n >= p.opts.MaxSamples:
+			e.status = Retired
+			e.reason = fmt.Sprintf("no significant difference after %d outcomes (%s %+.1f%%)", e.stats.n, obj.Metric, lift)
+			toRetire = append(toRetire, Retirement{Variant: e.v.Name, Kind: Inconclusive, Reason: e.reason, Decision: e.v.Decision})
+		default:
+			note := fmt.Sprintf("%s %+.1f%%, p=%.2g (need <%.2g", obj.Metric, lift, better, alpha)
+			if obj.MinLiftPct > 0 {
+				note += fmt.Sprintf(" and lift ≥%g%%", obj.MinLiftPct)
+			}
+			note += ")"
+			if len(suspected) > 0 {
+				note += "; " + strings.Join(suspected, "; ")
+			}
+			verdict.Waiting = append(verdict.Waiting, Pending{e.v.Name, note})
 		}
 	}
 	if best != nil {
 		champ.status, champ.reason = Retired, "replaced by "+best.e.v.Name
 		best.e.status = Champion
 		p.champion = best.e
-		verdict.Promoted, verdict.Dethroned, verdict.Lift = best.e.v.Name, champ.v.Name, best.lift
+		verdict.Promoted, verdict.Dethroned, verdict.Lift, verdict.P = best.e.v.Name, champ.v.Name, best.lift, best.p
 	}
 	p.mu.Unlock()
 
@@ -377,7 +501,7 @@ func (p *Population) Evaluate(ctx context.Context) (Verdict, error) {
 	}
 	for i := range toRetire {
 		r := &toRetire[i]
-		if p.opts.AutoRewind && r.Decision != "" {
+		if r.Kind == Breach && p.opts.AutoRewind && r.Decision != "" {
 			rep, err := p.opts.Ledger.Rewind(ctx, r.Decision, p.opts.Undoer, "auto-rewind: "+r.Reason, p.opts.Actor)
 			r.Rewind = &rep
 			if err != nil {
@@ -386,7 +510,7 @@ func (p *Population) Evaluate(ctx context.Context) (Verdict, error) {
 		}
 	}
 	verdict.Retired = toRetire
-	sort.Strings(verdict.Waiting)
+	sort.Slice(verdict.Waiting, func(i, j int) bool { return verdict.Waiting[i].Variant < verdict.Waiting[j].Variant })
 	return verdict, errors.Join(errs...)
 }
 
@@ -409,6 +533,14 @@ func (p *Population) Status() []VariantStatus {
 		out = append(out, VariantStatus{Name: n, Status: e.status, Reason: e.reason, Samples: e.stats.n, Averages: e.stats.means()})
 	}
 	return out
+}
+
+// Calibration returns the calibrator's current fit (nil without one).
+func (p *Population) Calibration() *counterfactual.Calibration {
+	if p.opts.Calibrator == nil {
+		return nil
+	}
+	return p.opts.Calibrator.Fit()
 }
 
 // Champion returns the current champion.
