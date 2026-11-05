@@ -29,6 +29,14 @@ type Record struct {
 	Actor    string     `json:"actor,omitempty"`
 	Reason   string     `json:"reason,omitempty"`
 	RewindOf string     `json:"rewind_of,omitempty"`
+
+	// Set by ChainLog: position, link to the previous record, this
+	// record's hash, and the signature of whoever is accountable for it.
+	Seq    int    `json:"seq,omitempty"`
+	Prev   string `json:"prev,omitempty"`
+	Hash   string `json:"hash,omitempty"`
+	Signer string `json:"signer,omitempty"`
+	Sig    string `json:"sig,omitempty"`
 }
 
 // Log stores decision records.

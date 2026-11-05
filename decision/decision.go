@@ -356,6 +356,15 @@ func (g *Graph) write(r Record) error {
 	if err := g.check(r); err != nil {
 		return err
 	}
+	// Every record names who is accountable for it.
+	switch r.Type {
+	case RecordNode:
+		r.Actor = r.Node.Actor
+	case RecordExecution:
+		if r.Actor == "" {
+			r.Actor = g.nodes[r.NodeID].Actor
+		}
+	}
 	if err := g.log.Append(r); err != nil {
 		return err
 	}
