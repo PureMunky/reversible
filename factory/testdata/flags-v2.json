@@ -1,0 +1,46 @@
+{
+  "service": "flags",
+  "purpose": "Feature flags for the platform team: who owns each flag, whether it is on, and how much traffic it reaches, so releases can be decoupled from deploys and rolled out gradually.",
+  "owner": "phil",
+  "resource": {
+    "name": "flag",
+    "plural": "flags",
+    "key": "key",
+    "fields": [
+      {"name": "key", "type": "string", "required": true, "pattern": "^[a-z][a-z0-9-]*$", "why": "keys appear in code and URLs"},
+      {"name": "owner", "type": "string", "required": true},
+      {"name": "enabled", "type": "bool", "default": false},
+      {"name": "description", "type": "string"},
+      {"name": "rollout_percent", "type": "int", "default": 100, "min": 0, "max": 100, "why": "share of traffic that sees the flag"}
+    ],
+    "rules": [
+      {"forbid_delete_when": {"field": "enabled", "equals": true}, "why": "turn a flag off before deleting it, so nothing still depends on it"}
+    ]
+  },
+  "examples": [
+    {"name": "create a flag", "request": {"method": "POST", "path": "/flags", "body": {"key": "new-checkout", "owner": "payments"}},
+     "expect": {"status": 201, "body": {"key": "new-checkout", "owner": "payments", "enabled": false, "rollout_percent": 100}}},
+    {"name": "flags start off", "request": {"method": "GET", "path": "/flags/new-checkout"},
+     "expect": {"status": 200, "body": {"enabled": false}}},
+    {"name": "turn it on for 10%", "request": {"method": "PATCH", "path": "/flags/new-checkout", "body": {"enabled": true, "rollout_percent": 10}},
+     "expect": {"status": 200, "body": {"key": "new-checkout", "enabled": true, "rollout_percent": 10}}},
+    {"name": "rollout is a percentage", "request": {"method": "PATCH", "path": "/flags/new-checkout", "body": {"rollout_percent": 150}},
+     "expect": {"status": 400}},
+    {"name": "every flag needs an owner", "request": {"method": "POST", "path": "/flags", "body": {"key": "orphan"}},
+     "expect": {"status": 400, "body": {"error": "owner is required"}}},
+    {"name": "keys are lowercase", "request": {"method": "POST", "path": "/flags", "body": {"key": "NewCheckout", "owner": "payments"}},
+     "expect": {"status": 400}},
+    {"name": "no duplicate keys", "request": {"method": "POST", "path": "/flags", "body": {"key": "new-checkout", "owner": "web"}},
+     "expect": {"status": 409}},
+    {"name": "list flags", "request": {"method": "GET", "path": "/flags"},
+     "expect": {"status": 200, "body": [{"key": "new-checkout", "rollout_percent": 10}]}},
+    {"name": "can't delete a flag that's on", "request": {"method": "DELETE", "path": "/flags/new-checkout"},
+     "expect": {"status": 409}},
+    {"name": "turn it off", "request": {"method": "PATCH", "path": "/flags/new-checkout", "body": {"enabled": false}},
+     "expect": {"status": 200, "body": {"enabled": false}}},
+    {"name": "then delete it", "request": {"method": "DELETE", "path": "/flags/new-checkout"},
+     "expect": {"status": 204}},
+    {"name": "deleted flags are gone", "request": {"method": "GET", "path": "/flags/new-checkout"},
+     "expect": {"status": 404}}
+  ]
+}
