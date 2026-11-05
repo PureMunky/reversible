@@ -109,16 +109,22 @@ func Simulate(ctx context.Context, p Program, req Request) (plan Plan) {
 	if err != nil {
 		return Plan{Err: err.Error()}
 	}
-	plan.Goal = in.Goal
+	if in.ID == "" {
+		in.ID = "counterfactual-" + req.ID
+	}
+	return PlanOf(in)
+}
+
+// PlanOf describes an intent as a plan without running anything. The
+// intent is validated exactly as the runtime would.
+func PlanOf(in reversible.Intent) Plan {
+	plan := Plan{Goal: in.Goal}
 	for _, e := range in.Effects {
 		pe := PlannedEffect{Name: e.Name, Class: e.Class, Description: e.Description}
 		if e.Spec != nil {
 			pe.Type, pe.Params = e.Spec.Type, maps.Clone(e.Spec.Params)
 		}
 		plan.Effects = append(plan.Effects, pe)
-	}
-	if in.ID == "" {
-		in.ID = "counterfactual-" + req.ID
 	}
 	if err := in.Validate(); err != nil {
 		plan.Err = err.Error()
@@ -198,6 +204,9 @@ type Config struct {
 	Simulators Simulators
 	// Guardrails block promotion when predicted totals move too far.
 	Guardrails []Guardrail
+	// Calibration corrects simulator output using what was actually
+	// observed (see Calibrator). Nil means raw simulator predictions.
+	Calibration *Calibration
 }
 
 // ReplayWith is Replay with simulators and guardrails.
@@ -211,6 +220,8 @@ func ReplayWith(ctx context.Context, cfg Config) Report {
 		if cfg.Simulators != nil {
 			cfg.Simulators.predict(req, &d.Baseline)
 			cfg.Simulators.predict(req, &d.Candidate)
+			cfg.Calibration.apply(d.Baseline.Predicted)
+			cfg.Calibration.apply(d.Candidate.Predicted)
 			d.MetricDelta = delta(d.Baseline.Predicted, d.Candidate.Predicted)
 			addInto(baseTotals, d.Baseline.Predicted)
 			addInto(candTotals, d.Candidate.Predicted)
