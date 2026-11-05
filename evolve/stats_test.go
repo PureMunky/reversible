@@ -64,9 +64,9 @@ func TestAlphaSpendingSumsToAlpha(t *testing.T) {
 // FNV routing, a customer trait derived from FNV(id+"#") was correlated
 // with the variant a customer got, biasing every comparison.
 func TestRoutingIndependentOfOtherHashesOfTheID(t *testing.T) {
-	p, err := New(Variant{Name: "a", Program: nil}, Options{Objective: Objective{Metric: "m"}})
+	p, err := New(Variant{Name: "", Program: nil}, Options{Objective: Objective{Metric: "m"}})
 	if err == nil {
-		t.Fatal("expected error for nil program")
+		t.Fatal("expected error for a nameless champion")
 	}
 	p, _ = New(Variant{Name: "a", Program: func(context.Context, counterfactual.Request) (reversible.Intent, error) {
 		return reversible.Intent{}, nil

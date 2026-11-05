@@ -47,6 +47,13 @@ type Objective struct {
 	// MinLiftPct is how much better (in percent of the champion's average)
 	// a challenger must be to be promoted.
 	MinLiftPct float64
+	// NonInferior promotes a challenger that is merely no worse: once it
+	// has MaxSamples outcomes with no guardrail breach (confirmed or
+	// suspected) and no significant evidence it is worse. This is how a
+	// canary release works, where the new version exists for reasons other
+	// than the metric (new features, new rules) and the question is only
+	// whether it does harm.
+	NonInferior bool
 }
 
 // Options configures a Population.
@@ -168,8 +175,8 @@ type Population struct {
 
 // New creates a population with an initial champion.
 func New(champion Variant, opts Options) (*Population, error) {
-	if champion.Name == "" || champion.Program == nil {
-		return nil, errors.New("champion needs a name and a program")
+	if champion.Name == "" {
+		return nil, errors.New("champion needs a name")
 	}
 	if opts.ChallengerShare == 0 {
 		opts.ChallengerShare = 0.2
@@ -188,6 +195,9 @@ func New(champion Variant, opts Options) (*Population, error) {
 	}
 	if opts.Objective.Metric == "" {
 		return nil, errors.New("an objective metric is required")
+	}
+	if opts.Objective.NonInferior && opts.MaxSamples <= 0 {
+		return nil, errors.New("a non-inferiority objective needs MaxSamples: how much evidence of no harm is enough")
 	}
 	if opts.AutoRewind && (opts.Ledger == nil || opts.Undoer == nil) {
 		return nil, errors.New("AutoRewind needs a Ledger and an Undoer")
@@ -289,6 +299,34 @@ func (p *Population) challengers() []*entry {
 	return out
 }
 
+// Admit adds a challenger that passed a gate the caller ran itself (for
+// example a behaviour diff of a built service), so it gets traffic
+// straight away. Its guardrail baseline is the current champion.
+func (p *Population) Admit(v Variant) error {
+	if v.Name == "" {
+		return errors.New("variant needs a name")
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if _, dup := p.entries[v.Name]; dup {
+		return fmt.Errorf("variant %q already exists", v.Name)
+	}
+	p.entries[v.Name] = &entry{v: v, status: Challenger, stats: newStats(), baseline: p.champion}
+	p.order = append(p.order, v.Name)
+	return nil
+}
+
+// Assign routes a request and records which variant got it, without
+// running anything: for variants served elsewhere, such as running
+// services behind a router. Report the outcome with Observe.
+func (p *Population) Assign(requestID string) Variant {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e := p.route(counterfactual.Request{ID: requestID})
+	p.served[requestID] = e.v.Name
+	return e.v
+}
+
 // Serve routes a request, records it for future gates, asks the chosen
 // variant for an intent, and executes it (linked to the variant's decision
 // when a ledger is configured).
@@ -303,6 +341,9 @@ func (p *Population) Serve(ctx context.Context, rt *reversible.Runtime, req coun
 		if err := p.opts.Recorder.Record(req); err != nil {
 			return v, nil, err
 		}
+	}
+	if v.Program == nil {
+		return v, nil, fmt.Errorf("variant %s has no program; it is served elsewhere (use Assign)", v.Name)
 	}
 	in, err := v.Program(ctx, req)
 	if err != nil {
@@ -376,14 +417,20 @@ type Verdict struct {
 	Promoted  string // new champion, if any
 	Dethroned string // old champion, if one was replaced
 	Lift      float64
-	P         float64 // p-value behind the promotion
-	Retired   []Retirement
-	Waiting   []Pending
+	P         float64 // p-value behind the promotion (for a non-inferior promotion: of the "worse" test)
+	// NonInferior is true when the promotion was for doing no harm, not
+	// for being better; Samples is the evidence it rests on.
+	NonInferior bool
+	Samples     int
+	Retired     []Retirement
+	Waiting     []Pending
 }
 
 func (v Verdict) String() string {
 	var b strings.Builder
-	if v.Promoted != "" {
+	if v.Promoted != "" && v.NonInferior {
+		fmt.Fprintf(&b, "promoted %s over %s: no harm after %d outcomes (%+.1f%% on objective)\n", v.Promoted, v.Dethroned, v.Samples, v.Lift)
+	} else if v.Promoted != "" {
 		fmt.Fprintf(&b, "promoted %s over %s (%+.1f%% on objective, p=%.2g)\n", v.Promoted, v.Dethroned, v.Lift, v.P)
 	}
 	for _, r := range v.Retired {
@@ -429,8 +476,9 @@ func (p *Population) Evaluate(ctx context.Context) (Verdict, error) {
 	obj := p.opts.Objective
 	var verdict Verdict
 	type candidate struct {
-		e       *entry
-		lift, p float64
+		e           *entry
+		lift, p     float64
+		nonInferior bool
 	}
 	var best *candidate
 	var toRetire []Retirement
@@ -491,6 +539,10 @@ func (p *Population) Evaluate(ctx context.Context) (Verdict, error) {
 		}
 		lift := liftPct(champ.stats.mean(obj.Metric), e.stats.mean(obj.Metric), obj.Maximize)
 		switch {
+		case obj.NonInferior && len(suspected) == 0 && worse >= alpha && e.stats.n >= p.opts.MaxSamples:
+			if best == nil || lift > best.lift {
+				best = &candidate{e: e, lift: lift, p: worse, nonInferior: true}
+			}
 		case len(suspected) == 0 && better < alpha && lift >= obj.MinLiftPct:
 			if best == nil || lift > best.lift {
 				best = &candidate{e: e, lift: lift, p: better}
@@ -503,6 +555,12 @@ func (p *Population) Evaluate(ctx context.Context) (Verdict, error) {
 			e.status = Retired
 			e.reason = fmt.Sprintf("no significant difference after %d outcomes (%s %+.1f%%)", e.stats.n, obj.Metric, lift)
 			toRetire = append(toRetire, Retirement{Variant: e.v.Name, Kind: Inconclusive, Reason: e.reason, Decision: e.v.Decision})
+		case obj.NonInferior:
+			note := fmt.Sprintf("%d/%d outcomes, %s %+.1f%%, no harm detected so far", e.stats.n, p.opts.MaxSamples, obj.Metric, lift)
+			if len(suspected) > 0 {
+				note = fmt.Sprintf("%d outcomes; %s", e.stats.n, strings.Join(suspected, "; "))
+			}
+			verdict.Waiting = append(verdict.Waiting, Pending{e.v.Name, note})
 		default:
 			note := fmt.Sprintf("%s %+.1f%%, p=%.2g (need <%.2g", obj.Metric, lift, better, alpha)
 			if obj.MinLiftPct > 0 {
@@ -520,6 +578,7 @@ func (p *Population) Evaluate(ctx context.Context) (Verdict, error) {
 		best.e.status = Champion
 		p.champion = best.e
 		verdict.Promoted, verdict.Dethroned, verdict.Lift, verdict.P = best.e.v.Name, champ.v.Name, best.lift, best.p
+		verdict.NonInferior, verdict.Samples = best.nonInferior, best.e.stats.n
 	}
 	p.mu.Unlock()
 
