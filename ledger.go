@@ -24,6 +24,8 @@ const (
 	EventCompensated        EventKind = "compensated"
 	EventCompensationFailed EventKind = "compensation_failed"
 	EventStranded           EventKind = "stranded"
+	EventUncertain          EventKind = "uncertain"
+	EventRecovered          EventKind = "recovered"
 )
 
 // Event is one append-only ledger entry. An empty Effect means the event is

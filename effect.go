@@ -45,6 +45,36 @@ func (c Class) String() string {
 	}
 }
 
+// MarshalText lets classes appear by name in snapshots and logs.
+func (c Class) MarshalText() ([]byte, error) { return []byte(c.String()), nil }
+
+// UnmarshalText parses a class name.
+func (c *Class) UnmarshalText(b []byte) error {
+	switch string(b) {
+	case "reversible":
+		*c = Reversible
+	case "escrowed":
+		*c = Escrowed
+	case "irreversible":
+		*c = Irreversible
+	default:
+		return fmt.Errorf("unknown effect class %q", b)
+	}
+	return nil
+}
+
+// Params are the inputs to a registered effect type. They are persisted,
+// so keep them small and non-secret.
+type Params map[string]string
+
+// Spec is the serializable description of an effect: which registered type
+// to run, and with what parameters. An effect with a Spec can be persisted
+// and rebuilt from a Registry after a restart.
+type Spec struct {
+	Type   string `json:"type"`
+	Params Params `json:"params,omitempty"`
+}
+
 // Receipt is the data an effect returns when it runs, and the data its
 // Undo needs to compensate it (an ID that was created, a prior value, etc.).
 // Receipts are written to the ledger, so keep them small and non-secret.
@@ -57,6 +87,10 @@ type Effect struct {
 	Description string
 	Do          func(ctx context.Context) (Receipt, error)
 	Undo        func(ctx context.Context, r Receipt) error
+
+	// Spec is set when the effect was built from a Registry. A runtime with
+	// a durable Store only accepts effects that have one.
+	Spec *Spec
 }
 
 func (e Effect) validate() error {

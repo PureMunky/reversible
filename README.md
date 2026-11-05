@@ -70,7 +70,58 @@ func createAccount(name string) reversible.Effect {
 }
 ```
 
-## Run the demo
+## Durability and crash recovery
+
+Closures can't be written to disk, so durable effects are built from a **Registry** of named effect types. An effect becomes a serializable **Spec** (`type` + `params`), and any process with the same registry can rebuild it.
+
+```go
+reg := reversible.NewRegistry()
+reg.MustRegister("card.charge", reversible.Handler{
+    Class: reversible.Escrowed,
+    Do: func(ctx context.Context, p reversible.Params) (reversible.Receipt, error) {
+        id, err := payments.Charge(ctx, p["customer"], p["amount"])
+        return reversible.Receipt{"charge": id}, err
+    },
+    Undo: func(ctx context.Context, p reversible.Params, r reversible.Receipt) error {
+        return payments.Refund(ctx, r["charge"])
+    },
+})
+
+store, _ := reversible.NewFileStore("state/intents")
+rt := reversible.New(reversible.WithStore(store), reversible.WithRegistry(reg))
+rt.Recover(ctx) // always first, on every startup
+
+rt.Execute(ctx, reversible.Intent{ID: "bill-acme", Effects: []reversible.Effect{
+    reg.MustEffect("charge", "card.charge", reversible.Params{"customer": "acme", "amount": "49"}),
+}})
+```
+
+With a store attached:
+
+- **Write-ahead.** Each step is saved as `in_flight` *before* its `Do` runs. If that save fails, the effect doesn't run and the intent rolls back.
+- **Escrow survives restarts.** Held effects, receipts and release times are on disk. A new process recovers them and can release or undo them.
+- **A crash counts as a failure.** If a process dies mid-intent, the next `Recover` rolls back everything that finished. The step that was mid-flight is marked **uncertain**: it may or may not have happened, so it's flagged for a human or a reconciler instead of being guessed at. Escrow after the crash point never runs.
+- **No double compensation.** State is saved after each compensation, and recovering an already-recovered intent is a no-op.
+- **Durable means durable.** A runtime with a store rejects closure-only effects (`ErrNotDurable`) instead of quietly losing them on restart.
+
+Handlers should be idempotent, since recovery and retries may call them for an effect whose outcome is unknown.
+
+### Try it across real process restarts
+
+`agentctl` is a CLI where every command is a separate process, backed by a fake world on disk:
+
+```sh
+go run ./cmd/agentctl -hold 30s onboard acme   # account + workspace created; charge + email held
+go run ./cmd/agentctl status
+go run ./cmd/agentctl undo onboard-acme wrong plan
+go run ./cmd/agentctl onboard globex 99
+go run ./cmd/agentctl release onboard-globex   # or wait out the hold and run: tick
+go run ./cmd/agentctl crash initech            # process dies mid-intent (exit 137)
+go run ./cmd/agentctl world                    # next process recovers and rolls it back
+go run ./cmd/agentctl log onboard-initech      # the ledger tells the story
+```
+
+## Run the in-memory demo
 
 ```sh
 go run ./cmd/demo            # irreversible effects denied (default)
@@ -90,16 +141,18 @@ The demo walks an agent through onboarding customers against a fake world:
 
 | Status | Meaning |
 |---|---|
+| `running` | Effects being applied (if found at startup: a crash, which `Recover` rolls back) |
 | `pending` | Reversible effects applied, escrowed effects held |
 | `committed` | Everything applied |
 | `rolled_back` | Undone, and nothing remains in the world |
-| `partially_rolled_back` | Undone, but some effects couldn't be (see `Result.Stranded()`) |
+| `partially_rolled_back` | Undone, but some effects couldn't be (`Result.Stranded()`) or may have happened (`Result.Uncertain()`) |
 | `rejected` | A gate denied an irreversible effect, so nothing ran |
 
 ## Limitations (it's a prototype)
 
-- **Escrow lives in memory.** Effects are Go closures, so held escrow doesn't survive a restart. A durable version needs effects to be serializable descriptions that a registry rehydrates.
-- **The ledger is best-effort.** A production runtime would write ahead and refuse to act if the ledger write fails.
+- **Uncertain steps need reconciling by hand.** The runtime flags them but can't yet ask the world what actually happened. A `Reconcile` hook per effect type is the natural next step.
+- **The ledger is an audit trail, not the source of truth.** Recovery depends on the store; the ledger is best-effort. Unifying them is part of the decision-ledger work.
+- **One process at a time per store.** There's no locking or leasing, so two processes sharing a state directory can conflict.
 - **Compensation is trusted.** An `Undo` that lies or partially succeeds isn't detected. Verifying that compensation actually restored the prior state is an open problem.
 - **Single process.** No distributed coordination across services yet.
 
@@ -107,7 +160,7 @@ The demo walks an agent through onboarding customers against a fake world:
 
 This is step one of three foundations:
 
-1. **Effect system** (this repo): agents act freely because everything is declared and undoable.
+1. **Effect system** (this repo): agents act freely because everything is declared, undoable, and survives a crash.
 2. **Decision ledger:** a causal graph of intent → decision → artifact → outcome, so you can rewind a *decision*, not just an action.
 3. **Counterfactual runtime:** run candidate changes against replayed production traffic with every effect intercepted, so testing becomes watching what *would* have happened.
 

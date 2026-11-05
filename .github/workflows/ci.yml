@@ -21,3 +21,11 @@ jobs:
         run: go test -race ./...
       - name: demo
         run: go run ./cmd/demo
+      - name: crash-recovery smoke test
+        run: |
+          go build -o agentctl ./cmd/agentctl
+          ./agentctl -dir "$RUNNER_TEMP/st" onboard acme
+          ./agentctl -dir "$RUNNER_TEMP/st" crash initech || test $? -eq 137
+          ./agentctl -dir "$RUNNER_TEMP/st" status | tee out.txt
+          grep -q "recovered onboard-initech" out.txt
+          grep -q "onboard-acme *pending" out.txt
