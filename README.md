@@ -1,10 +1,12 @@
 # reversible
 
-**Agents don't need permission. They need undo.**
+**Change the way software is built.**
 
-`reversible` is a prototype runtime for agentic software, written in Go with no dependencies. Instead of gating every action behind a human, every action an agent takes is *declared up front* and *undoable by construction*, every decision is *traceable and rewindable*, and every proposed change is *replayed against real traffic* before it's allowed to act. Only the actions that truly can't be undone get routed to a person, and the architecture's job is to keep that set as small as possible.
+In an agentic world, writing code is cheap. What's scarce is knowing exactly what's wanted, and trusting that what was built matches it. So the thing being built should be *intent*, and code should be a cache that falls out of it: generated, regenerated, never hand-maintained. History should record *decisions*, not diffs. Every effect on the world should be undoable, so agents need undo rather than permission. And changes should be judged by their *behaviour* on real traffic, not by reading code. The full thesis, and how each piece of this repo serves it, is in [PRINCIPLES.md](PRINCIPLES.md).
 
-It explores a larger idea: software built for agents, where intent and consequences are the primary artifacts and code is something that gets regenerated in between.
+`reversible` is a working prototype of that idea's foundations, in Go with no dependencies. Every action an agent takes is *declared up front* and *undoable by construction*; every decision is *traceable and rewindable*; every proposed change is *replayed against real traffic* and evolved against the current version on evidence. Only the actions that truly can't be undone reach a person.
+
+**Where it stands:** the foundations govern how changes reach the world safely, and a model can already generate behaviour (as policies) from intent and evidence. The demos use pricing as an example domain; nothing in the mechanism assumes it. The next milestone is the root idea itself: a conversation produces intent, a model generates **a real service**, and the system builds, tests, diffs, releases and regenerates it with no human editing code.
 
 ## Layers
 
