@@ -16,6 +16,7 @@ const Contract = `- package main, a single file main.go, Go standard library onl
 - manage one resource at /<plural>: POST /<plural> creates (201 + record), GET /<plural> lists all sorted by key (200), GET /<plural>/{key} (200 or 404), PATCH /<plural>/{key} partially updates (200), DELETE /<plural>/{key} (204)
 - apply each field's default to fields missing on create; reject unknown fields, missing required fields, wrong types and invalid values with 400; a duplicate key on create is 409; changing the key on PATCH is 400; a missing record is 404; a delete refused by a rule is 409
 - every error response is JSON {"error": "<message>"}; GET /healthz returns 200
+- the caller is identified by the X-Caller request header; a rule's except_callers lists callers it does not apply to
 - the spec's examples are the contract: they will be run in order against a fresh instance and every one must pass`
 
 // Coder turns intent into source files. A previous attempt and the
@@ -345,7 +346,11 @@ func apply(rec *%[1]s, raw map[string]json.RawMessage) string {
 		if rule.Why != "" {
 			msg += " (" + rule.Why + ")"
 		}
-		w("\t\tif rec.%s == %s {\n\t\t\tfail(w, 409, %q)\n\t\t\treturn\n\t\t}\n", goName(c.Field), goLiteral(field.Type, c.Equals), msg)
+		cond := fmt.Sprintf("rec.%s == %s", goName(c.Field), goLiteral(field.Type, c.Equals))
+		for _, ex := range rule.ExceptCallers {
+			cond += fmt.Sprintf(" && r.Header.Get(\"X-Caller\") != %q", ex)
+		}
+		w("\t\tif %s {\n\t\t\tfail(w, 409, %q)\n\t\t\treturn\n\t\t}\n", cond, msg)
 	}
 	w(`		delete(store, key)
 		save()

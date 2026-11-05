@@ -59,7 +59,9 @@ type Field struct {
 type Rule struct {
 	// ForbidDeleteWhen refuses deletion while a field has a value.
 	ForbidDeleteWhen *Condition `json:"forbid_delete_when,omitempty"`
-	Why              string     `json:"why,omitempty"`
+	// ExceptCallers are callers (by X-Caller) the rule doesn't apply to.
+	ExceptCallers []string `json:"except_callers,omitempty"`
+	Why           string   `json:"why,omitempty"`
 }
 
 // Condition is "field equals value".
@@ -81,6 +83,10 @@ type HTTPCall struct {
 	Method string `json:"method"`
 	Path   string `json:"path"`
 	Body   any    `json:"body,omitempty"`
+	// Caller identifies who is calling (sent as the X-Caller header), so
+	// rules can treat callers differently and production findings can say
+	// who was affected.
+	Caller string `json:"caller,omitempty"`
 }
 
 // Expectancy is what a response must contain. Body is matched as a
@@ -238,6 +244,11 @@ func (s ServiceSpec) Check() []Question {
 		}
 		if rule.Why == "" {
 			ask(Clarify, where, "why does this rule exist? The reason is shown to whoever hits it")
+		}
+		for _, c := range rule.ExceptCallers {
+			if strings.TrimSpace(c) == "" {
+				ask(Blocking, where, "except_callers has an empty caller name")
+			}
 		}
 	}
 

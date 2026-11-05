@@ -129,6 +129,9 @@ func Call(ctx context.Context, base string, c HTTPCall) (Response, error) {
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
+	if c.Caller != "" {
+		req.Header.Set("X-Caller", c.Caller)
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return Response{}, err

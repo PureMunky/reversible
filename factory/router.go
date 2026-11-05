@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"sync"
 
 	"github.com/PureMunky/reversible"
@@ -29,6 +30,28 @@ type Router struct {
 	live    *Version
 	inst    *Instance
 	traffic []Exchange
+	marks   []ReleaseMark
+}
+
+// ReleaseMark records a change of live version: what was live before,
+// where the traffic log stood, and a snapshot of production data at that
+// moment. Together they let the factory ask what the previous version
+// would have done with exactly the traffic the new one served.
+type ReleaseMark struct {
+	Version      *Version // nil if the service was taken down
+	Previous     *Version // nil for a first release
+	TrafficIndex int      // traffic recorded before this release
+	Snapshot     string   // copy of production data at the moment of release ("" if none yet)
+}
+
+// LastRelease returns the most recent release mark.
+func (r *Router) LastRelease() (ReleaseMark, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if len(r.marks) == 0 {
+		return ReleaseMark{}, false
+	}
+	return r.marks[len(r.marks)-1], true
 }
 
 // Live returns the version serving traffic.
@@ -47,7 +70,7 @@ func (r *Router) Traffic() []Exchange {
 
 // ServeHTTP forwards a request to the live version and records it.
 func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	call := HTTPCall{Method: req.Method, Path: req.URL.Path}
+	call := HTTPCall{Method: req.Method, Path: req.URL.Path, Caller: req.Header.Get("X-Caller")}
 	if raw, _ := io.ReadAll(io.LimitReader(req.Body, 1<<20)); len(raw) > 0 {
 		var body any
 		if json.Unmarshal(raw, &body) != nil {
@@ -90,6 +113,14 @@ func (r *Router) swap(ctx context.Context, v *Version) (*Version, error) {
 	}
 	r.mu.Lock()
 	prev, old := r.live, r.inst
+	mark := ReleaseMark{Version: v, Previous: prev, TrafficIndex: len(r.traffic)}
+	if data, err := os.ReadFile(r.DataPath); err == nil {
+		mark.Snapshot = fmt.Sprintf("%s.release-%d", r.DataPath, len(r.marks)+1)
+		if err := os.WriteFile(mark.Snapshot, data, 0o644); err != nil {
+			mark.Snapshot = ""
+		}
+	}
+	r.marks = append(r.marks, mark)
 	r.live, r.inst = v, inst
 	r.mu.Unlock()
 	old.Stop()
