@@ -92,6 +92,9 @@ type Trial struct {
 	Decision string
 	Status   evolve.Status
 	Reason   string
+	// Samples and Averages are the observed outcomes so far.
+	Samples  int
+	Averages map[string]float64
 }
 
 // State is what a Generator sees.
@@ -237,6 +240,7 @@ func (l *Loop) stateLocked() State {
 			if s.Reason != "" {
 				l.trials[i].Reason = s.Reason
 			}
+			l.trials[i].Samples, l.trials[i].Averages = s.Samples, s.Averages
 		}
 	}
 	champ := l.pop.Champion().Name

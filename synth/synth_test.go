@@ -110,8 +110,7 @@ func (hn *harness) serve(t *testing.T, count int) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		price, _ := strconv.Atoi(strings.TrimPrefix(v.Name, "$"))
-		hn.pop.Observe(req.ID, reality(c, price))
+		hn.pop.Observe(req.ID, reality(c, plannedPrice(v.Program, req)))
 	}
 }
 
@@ -197,4 +196,17 @@ func TestMaxLiveCapsConcurrentChallengers(t *testing.T) {
 	if rep, _ := hn.loop.Step(context.Background()); len(rep.Admitted)+len(rep.Rejected) != 0 {
 		t.Fatalf("proposed past MaxLive: %+v", rep)
 	}
+}
+
+// plannedPrice reads the charge amount a variant plans for a request,
+// whatever the variant is called.
+func plannedPrice(p counterfactual.Program, req counterfactual.Request) int {
+	plan := counterfactual.Simulate(context.Background(), p, req)
+	for _, e := range plan.Effects {
+		if e.Type == "card.charge" {
+			n, _ := strconv.Atoi(e.Params["amount"])
+			return n
+		}
+	}
+	return 0
 }
