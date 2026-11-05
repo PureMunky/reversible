@@ -14,6 +14,7 @@ In an agentic world, writing code is cheap. What's scarce is knowing exactly wha
 go run ./cmd/factory                        # offline: deterministic coder
 ANTHROPIC_API_KEY=sk-... go run ./cmd/factory  # Claude drafts the spec and writes the code
 go run ./cmd/factory -faulty-coder          # a coder with a migration bug, caught before release
+go run ./cmd/factory -brittle-coder         # a defect only real traffic shows, stopped by the canary
 go run ./cmd/factory -show-prompts          # every prompt a model would be sent, calling nothing
 go run ./cmd/factory -keep                  # keep the generated code and data to read afterwards
 ```
@@ -27,11 +28,13 @@ A real service built, changed, released and rewound from conversation. Nobody wr
 3. **The team uses it for a week.** Every request is recorded.
 4. **Phil changes the intent, not the code:** gradual rollouts, and no deleting a flag that's still on. A new service is generated (12/12 examples pass).
 5. **What would change, shown as behaviour.** The week's traffic is replayed through both versions: 17 requests would behave differently, and every one is traced to what Phil asked for (14 by the new field, 1 by the new rule, 2 as knock-on effects of that refused delete). Every existing flag is also read through both versions, to catch anything that misreads old data.
-6. **Phil signs off; v2 goes live** on the same production data.
+6. **Phil signs off; v2 is released as a canary.** Before it touches production, the review also runs both versions on the same data to check neither destroys the other's fields. Then v2 serves 20% of real traffic beside v1, every outcome is attributed to the version that served it, and after 81 requests with no harm the evolution runtime promotes it.
 7. **A team's cleanup script breaks** on the new rule. Phil rewinds the *decision*; v1 is live again, with the data intact.
 8. **Production raises questions.** After another week, the factory compares everything v2 did with what v1 would have done from the same data. Two findings: the web team and the nightly cleanup bot each had deletes refused by the new rule. Each becomes a question for Phil, with intent changes as answers: keep refusing, exempt the caller, or drop the rule.
 9. **The answers are the new intent.** Phil keeps the rule for people and exempts the bot. v3 is generated, with four of its examples captured from the production requests, so the decision is now contract. Every behaviour change is traced to the exemption; a week later, no new findings.
 10. **Every decision stays reversible.** Phil rewinds his answer and v2 is live again on the same data; reaffirming it is served from the cache, with nothing regenerated.
+
+With `-brittle-coder`, the v2 build fails reads of any flag with a description. No example reads one and the review sees none, so it passes everything before release; in the canary it fails real requests, the error guardrail trips after 200 requests (5 of 221 requests ever failed, all on the canary's share), the decision behind it is rewound and v1 serves everything.
 
 With `-faulty-coder`, the v2 build still passes all 12 examples, but reading production data through it shows every existing flag that was on silently dropping to 0% rollout. That change isn't explained by anything Phil asked for, so it isn't released. Examples alone would have shipped it.
 
@@ -39,7 +42,7 @@ With `-faulty-coder`, the v2 build still passes all 12 examples, but reading pro
 
 | Layer | Package | Answers | Key operation |
 |---|---|---|---|
-| **Factory** | `reversible/factory` | *Build the software itself from intent, and let production revise it* | `Capture`, `Check`, `Build`, `Diff`, `DiffState`, `Router.Release`, `Observe`, `Propose` |
+| **Factory** | `reversible/factory` | *Build the software itself from intent, release it on evidence, and let production revise it* | `Capture`, `Check`, `Build`, `ReviewCandidate`, `StartCanary`, `Observe`, `Propose` |
 | **Effect system** | `reversible` | *What happened, and can it be undone?* | `Execute`, `Undo`, `Release`, `Recover` |
 | **Decision ledger** | `reversible/decision` | *Why did it happen, and who decided?* | `Decide`, `Explain`, `Rewind`, `ChainLog` |
 | **Counterfactual runtime** | `reversible/counterfactual` | *What would this change do, and what would happen?* | `Replay`, `ReplayWith` + `Simulators` |

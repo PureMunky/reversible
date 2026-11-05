@@ -37,7 +37,7 @@ If a change can't answer these, it is plumbing for some other idea.
 | History is decisions, not diffs | Every release traces to the conversation that caused it, in a signed, hash-chained ledger; rewinding a decision takes the running software back | `decision`, `factory` |
 | Reversibility replaces permission | Releases, and every other effect, are declared and undoable; crash recovery | `reversible`, `factory` |
 | Behaviour is reviewed, not code | Recorded traffic replayed through both versions; every difference traced to the intent change that explains it (including knock-on effects); existing production data read through both versions; unexplained differences block sign-off | `factory`, `counterfactual` |
-| Releases become evolution | Gated challengers, significance testing, automatic rewind | `evolve` |
+| Releases become evolution | A reviewed build runs as a canary beside the live version on the same data; every request's outcome is attributed to the version that served it, and significance testing promotes it when there's enough evidence of no harm, or retires it and rewinds the decision behind it when it does harm | `factory`, `evolve` |
 | Production is an input | After each release, production traffic is compared with what the previous version would have done from the same data; refusals and failures become questions for the owner whose answers are new intent, and the production request becomes part of the contract | `factory`, `counterfactual`, `synth` |
 
 **First slice closed:** `go run ./cmd/factory` builds, changes, releases and rewinds a real service from conversation, with no person writing or editing code. Run it with `-faulty-coder` to watch a build that passes every example get stopped because it would silently change existing production data.
@@ -46,6 +46,7 @@ If a change can't answer these, it is plumbing for some other idea.
 
 - **The spec language is small.** One resource, field validation, one kind of rule. Real services need several resources, relations, queries, auth and integrations.
 - **The offline coder is a compiler, not a model.** Without `ANTHROPIC_API_KEY`, the spec is written alongside each conversation and code comes from a deterministic generator. The Claude path (capture and coding, with a repair loop) is tested against scripted replies, not yet against a live model; [docs/RUNNING-WITH-CLAUDE.md](docs/RUNNING-WITH-CLAUDE.md) is the guide for doing that safely.
-- **Releases are all at once.** The factory's versions aren't yet released through `evolve`'s gated challengers and live statistics.
+- **Canaries judge harm narrowly.** A canary is stopped for server errors; it records latency but doesn't guard it, and it doesn't yet compare refusals or business outcomes between versions while both are live (Observe does that after promotion).
+- **Shared state is a file.** Versions share data through a JSON file read on every request, which is what makes canaries safe here but wouldn't scale; real services would share a database, and MixedCheck would need to cover schema changes there.
 - **Production findings are narrow.** Observe finds new refusals and server errors; it doesn't yet notice latency, business outcomes, or behaviour that's wrong but not an error. The answers it offers are fixed per finding type; a model could propose richer intent changes.
 - **Behaviour diffs replay from empty state.** Observe now uses a snapshot taken at each release; pre-release diffs still replay all traffic from empty.

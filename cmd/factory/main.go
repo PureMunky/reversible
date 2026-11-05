@@ -4,6 +4,7 @@
 //	go run ./cmd/factory                        # offline: deterministic coder
 //	ANTHROPIC_API_KEY=... go run ./cmd/factory  # Claude drafts the spec and writes the code
 //	go run ./cmd/factory -faulty-coder          # a coder with a migration bug: watch it get caught
+//	go run ./cmd/factory -brittle-coder         # a defect only real traffic shows: watch the canary stop it
 //	go run ./cmd/factory -show-prompts          # print every prompt a model would get, calling nothing
 //	go run ./cmd/factory -keep                  # keep the generated code and data to read afterwards
 package main
@@ -43,6 +44,7 @@ var conversation2 = []factory.Turn{
 func main() {
 	faulty := flag.Bool("faulty-coder", false, "use a coder that forgets defaults when loading old data")
 	showPrompts := flag.Bool("show-prompts", false, "print exactly what a model would be sent at each step, without calling one")
+	brittleCoder := flag.Bool("brittle-coder", false, "use a coder whose later builds fail on real traffic in a way no example or review shows: watch the canary stop it")
 	keep := flag.Bool("keep", false, "keep the work directory (generated code, builds, production data) and print where it is")
 	flag.Parse()
 	ctx := context.Background()
@@ -95,6 +97,10 @@ func main() {
 		coder = showing{shower: shower, inner: coder}
 		who += "; -show-prompts: printing every model prompt, calling nothing"
 	}
+	if *brittleCoder {
+		coder = &brittle{inner: coder}
+		who += "; -brittle-coder: builds after the first fail reads of flags that have a description"
+	}
 	if *faulty {
 		coder = forgetful{coder}
 		who += "; -faulty-coder: the coder forgets defaults when loading existing data"
@@ -144,6 +150,32 @@ func main() {
 		return s
 	}
 	totalGenerated := 0
+	reads := 0
+	// canaryRelease runs v beside the live version on a fifth of real
+	// traffic until the evolution runtime promotes or stops it.
+	canaryRelease := func(decisionID string, v *factory.Version) factory.CanaryResult {
+		live := router.Live().SpecHash
+		c, err := factory.StartCanary(ctx, router, v, g, rt, decisionID, factory.CanaryOptions{
+			Share: 0.2, MinSamples: 30, MaxSamples: 80, Salt: "factory-demo-" + v.SpecHash})
+		check(err)
+		fmt.Printf("   canary: %s takes 20%% of traffic beside %s, on the same data\n", v.SpecHash, live)
+		var res factory.CanaryResult
+		for round := 1; round <= 20; round++ {
+			for _, call := range appReads(200, reads) {
+				_, err := factory.Call(ctx, prod.URL, call)
+				check(err)
+			}
+			reads += 200
+			res, err = c.Evaluate(ctx)
+			check(err)
+			fmt.Printf("   +%d requests: %s\n", round*200, res)
+			if res.Promoted || res.Stopped {
+				break
+			}
+		}
+		fmt.Printf("   live: %s\n", router.Live().SpecHash)
+		return res
+	}
 
 	fmt.Println("Software built from intent. Nobody writes or edits code in this run.")
 	fmt.Println("mode:", who)
@@ -217,32 +249,38 @@ func main() {
 	totalGenerated += v2.Lines()
 
 	head("6 · What would change, on real traffic and real data")
-	fmt.Println("   replaying the week's traffic through both versions:")
-	d, err := factory.Diff(ctx, router.Traffic(), v1, v2)
+	review, err := factory.ReviewCandidate(ctx, router, v2)
 	check(err)
-	fmt.Print(indent(indent(d.String())))
-	fmt.Println("   reading every existing flag through both versions:")
-	sd, err := factory.DiffState(ctx, router.DataPath, v1, v2)
-	check(err)
-	fmt.Print(indent(indent(sd.String())))
+	fmt.Print(indent(review.String()))
+	d, sd := review.Replay, review.State
 
-	unexplained := len(d.Unexpected()) + len(sd.Unexpected())
-	if unexplained > 0 {
+	if !review.Clean() {
 		head("7 · Phil does NOT sign off")
-		fmt.Printf("   %d change(s) aren't explained by anything Phil asked for. Nothing is released.\n", unexplained)
+		fmt.Printf("   %d change(s) aren't explained by anything Phil asked for. Nothing is released.\n", len(d.Unexpected())+len(sd.Unexpected())+len(review.Mixed))
 		fmt.Println("   The examples all passed; only checking the change against production data caught it.")
 		finish(g, store, keys, totalGenerated, router, "wrote two short conversations, answered the spec's questions, signed off once, and refused a release whose effect on existing data nobody asked for")
 		return
 	}
 
-	head("7 · Phil signs off on that reality; v2 goes live")
+	head("7 · Phil signs off on that reality; v2 is released as a canary, and outcomes decide")
 	_, err = g.Decide(decision.Decision{ID: "signoff-2", Parents: []string{"intent-2"}, Actor: "phil",
 		Summary: "release flags " + v2.SpecHash, Rationale: fmt.Sprintf("%d behaviour changes, all explained by intent-2", len(d.Changes)+len(sd.Changes))})
 	check(err)
-	_, err = g.Execute(ctx, rt, "signoff-2", reversible.Intent{ID: "release-" + v2.SpecHash, Effects: []reversible.Effect{router.Release(v2)}})
-	check(err)
+	if res := canaryRelease("signoff-2", v2); res.Stopped {
+		errs, total := 0, 0
+		for _, ex := range router.Traffic() {
+			total++
+			if ex.Response.Status >= 500 {
+				errs++
+			}
+		}
+		fmt.Printf("   The build passed all its examples and the full review; real traffic found the defect.\n")
+		fmt.Printf("   %d of %d requests ever failed, all on the canary's share; the decision behind it is rewound and v1 serves everything.\n", errs, total)
+		finish(g, store, keys, totalGenerated, router, "wrote two short conversations, answered the spec's questions, signed off once; the canary and its evidence stopped a bad release without anyone watching")
+		return
+	}
 	sample := firstEnabled(ctx, prod.URL)
-	fmt.Printf("   live: %s. %s\n", router.Live().SpecHash, sample)
+	fmt.Printf("   %s\n", sample)
 	r, _ := factory.Call(ctx, prod.URL, factory.HTTPCall{Method: "DELETE", Path: "/flags/" + strings.Fields(sample)[0], Caller: "web"})
 	fmt.Printf("   deleting it now: %d %s\n", r.Status, compact(r.Body))
 
@@ -307,8 +345,7 @@ func main() {
 	_, err = g.Decide(decision.Decision{ID: "signoff-3", Parents: []string{"intent-3"}, Actor: "phil",
 		Summary: "release flags " + v3.SpecHash, Rationale: "behaviour changes match the answers"})
 	check(err)
-	_, err = g.Execute(ctx, rt, "signoff-3", reversible.Intent{ID: "release-" + v3.SpecHash, Effects: []reversible.Effect{router.Release(v3)}})
-	check(err)
+	canaryRelease("signoff-3", v3)
 	for _, c := range weekThree() {
 		_, err := factory.Call(ctx, prod.URL, c)
 		check(err)
@@ -316,7 +353,7 @@ func main() {
 	after, err := factory.Observe(ctx, router)
 	check(err)
 	if len(after) == 0 {
-		fmt.Printf("   live: %s. A week later: no new findings; the cleanup bot's deletes work, everyone else still turns flags off first.\n", router.Live().SpecHash)
+		fmt.Println("   A week later: no new findings; the cleanup bot's deletes work, everyone else still turns flags off first.")
 	} else {
 		for _, f := range after {
 			fmt.Println("   •", f)
@@ -338,7 +375,7 @@ func main() {
 	check(err)
 	fmt.Printf("   live: %s\n", router.Live().SpecHash)
 
-	finish(g, store, keys, totalGenerated, router, "wrote two short conversations, answered the spec's questions and production's, signed off on behaviour three times, rewound one decision")
+	finish(g, store, keys, totalGenerated, router, "wrote two short conversations, answered the spec's questions and production's, signed off on behaviour three times, rewound one decision (canaries and evidence decided the releases)")
 }
 
 func finish(g *decision.Graph, store decision.Log, keys *decision.Keyring, generated int, router *factory.Router, did string) {
@@ -353,9 +390,12 @@ func finish(g *decision.Graph, store decision.Log, keys *decision.Keyring, gener
 	}
 	fmt.Println()
 	if live := router.Live(); live != nil {
-		why, err := g.ExplainIntent("release-" + live.SpecHash + "-again")
-		if err != nil {
-			why, err = g.ExplainIntent("release-" + live.SpecHash)
+		var why string
+		var err error
+		for _, id := range []string{"release-" + live.SpecHash + "-again", "promote-" + live.SpecHash, "release-" + live.SpecHash} {
+			if why, err = g.ExplainIntent(id); err == nil {
+				break
+			}
 		}
 		if err == nil {
 			fmt.Println("\n   why is this version live?")
@@ -388,6 +428,22 @@ func teamWeek() []factory.HTTPCall {
 		factory.HTTPCall{Method: "DELETE", Path: "/flags/fast-login", Caller: "cleanup-bot"},
 		factory.HTTPCall{Method: "GET", Path: "/flags", Caller: "web"},
 	)
+	return out
+}
+
+// appReads is most of a flag service's traffic: app servers reading flags,
+// with the occasional note from a person.
+func appReads(n, offset int) []factory.HTTPCall {
+	keys := []string{"dark-mode", "new-search", "one-click-pay", "offline-sync", "push-v2"}
+	var out []factory.HTTPCall
+	for i := offset; i < offset+n; i++ {
+		k := keys[i%len(keys)]
+		if i%25 == 0 {
+			out = append(out, factory.HTTPCall{Method: "PATCH", Path: "/flags/" + k, Body: map[string]any{"description": fmt.Sprint("reviewed ", i)}, Caller: "web"})
+			continue
+		}
+		out = append(out, factory.HTTPCall{Method: "GET", Path: "/flags/" + k, Caller: "app-servers"})
+	}
 	return out
 }
 
@@ -442,6 +498,26 @@ type showing struct {
 func (s showing) Code(ctx context.Context, spec factory.ServiceSpec, prev map[string]string, fail []factory.Result) (map[string]string, error) {
 	factory.ModelCoder{Model: s.shower}.Code(ctx, spec, prev, fail)
 	return s.inner.Code(ctx, spec, prev, fail)
+}
+
+// brittle wraps a coder: every build after the first fails reads of flags
+// that have a description. No example reads such a flag, and replay and
+// review see no descriptions yet, so only real traffic can find it.
+type brittle struct {
+	inner factory.Coder
+	first string
+}
+
+func (b *brittle) Code(ctx context.Context, s factory.ServiceSpec, prev map[string]string, fail []factory.Result) (map[string]string, error) {
+	files, err := b.inner.Code(ctx, s, prev, fail)
+	if b.first == "" {
+		b.first = s.Hash()
+	}
+	if err == nil && s.Hash() != b.first {
+		files["main.go"] = strings.Replace(files["main.go"], "\t\treply(w, 200, rec)\n\t})\n\n\tmux.HandleFunc(\"PATCH",
+			"\t\tif rec.Description != \"\" {\n\t\t\tfail(w, 500, \"internal error\")\n\t\t\treturn\n\t\t}\n\t\treply(w, 200, rec)\n\t})\n\n\tmux.HandleFunc(\"PATCH", 1)
+	}
+	return files, err
 }
 
 // forgetful wraps a coder and introduces a classic migration bug: records

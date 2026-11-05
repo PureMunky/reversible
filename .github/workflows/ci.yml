@@ -53,6 +53,12 @@ jobs:
           grep -q "Phil answers 2" factory.txt
           grep -q "were captured from production requests" factory.txt
           grep -q "no new findings" factory.txt
+          grep -q "is released as a canary" factory.txt
+          grep -q "no harm after" factory.txt
+          grep -q "each keeps the other's fields" factory.txt
+          go run ./cmd/factory -brittle-coder | tee brittle.txt
+          grep -q "guardrail breach" brittle.txt
+          grep -q "v1 serves everything" brittle.txt
           go run ./cmd/factory -show-prompts | tee prompts.txt
           grep -q "what the model would be sent (not sent: -show-prompts)" prompts.txt
           ! pgrep -f "factory-demo-.*/service"

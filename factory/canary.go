@@ -3,7 +3,6 @@ package factory
 import (
 	"context"
 	"errors"
-	"fmt"
 	"strings"
 
 	"github.com/PureMunky/reversible"
@@ -216,11 +215,12 @@ func indentLines(s, prefix string) string {
 
 // String summarises a canary result.
 func (r CanaryResult) String() string {
+	v := strings.Join(strings.Fields(strings.ReplaceAll(strings.TrimSpace(r.Verdict.String()), "\n", "; ")), " ")
 	switch {
 	case r.Promoted:
-		return fmt.Sprintf("promoted: %s", strings.TrimSpace(r.Verdict.String()))
+		return "promoted: " + v
 	case r.Stopped:
-		return fmt.Sprintf("stopped: %s", strings.TrimSpace(r.Verdict.String()))
+		return "stopped: " + v
 	default:
 		return "running: " + r.Waiting
 	}
