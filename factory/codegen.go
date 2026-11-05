@@ -12,7 +12,8 @@ import (
 // It is given verbatim to model coders.
 const Contract = `- package main, a single file main.go, Go standard library only
 - listen on the address in env ADDR (default "127.0.0.1:0") and print exactly one line "LISTENING http://<host:port>" to stdout once listening
-- if env DATA is set, load all records from that JSON file (a JSON array) at start and rewrite it after every change; ignore unknown fields; a missing file means empty; a record missing a field gets that field's default (data written by an older version must keep working)
+- if env DATA is set, it holds all records as a JSON array of objects; a missing file means empty; other versions of the service may be running against the same file at the same time, so read it at the start of every request (not just at startup) and rewrite it after every change
+- a record missing a field gets that field's default (data written by an older version must keep working); fields you don't know about must be kept when rewriting a record, though not returned in responses (data written by a newer version must survive)
 - manage one resource at /<plural>: POST /<plural> creates (201 + record), GET /<plural> lists all sorted by key (200), GET /<plural>/{key} (200 or 404), PATCH /<plural>/{key} partially updates (200), DELETE /<plural>/{key} (204)
 - apply each field's default to fields missing on create; reject unknown fields, missing required fields, wrong types and invalid values with 400; a duplicate key on create is 409; changing the key on PATCH is 400; a missing record is 404; a delete refused by a rule is 409
 - every error response is JSON {"error": "<message>"}; GET /healthz returns 200
@@ -158,10 +159,15 @@ func generate(s ServiceSpec) string {
 	w(`var (
 	mu       sync.Mutex
 	store    = map[string]%[1]s{}
+	extras   = map[string]map[string]json.RawMessage{} // fields other versions wrote that this one doesn't know
 	dataPath = os.Getenv("DATA")
 )
 
+// load reads shared state. Other versions may be running against the same
+// data, so it is read at the start of every request, not just once.
 func load() {
+	store = map[string]%[1]s{}
+	extras = map[string]map[string]json.RawMessage{}
 	if dataPath == "" {
 		return
 	}
@@ -169,22 +175,47 @@ func load() {
 	if err != nil {
 		return
 	}
-	var all []json.RawMessage
-	if json.Unmarshal(b, &all) == nil {
-		for _, raw := range all {
-			r := defaults() // records written by an older version get today's defaults
-			if json.Unmarshal(raw, &r) == nil {
-				store[r.%[2]s] = r
+	var all []map[string]json.RawMessage
+	if json.Unmarshal(b, &all) != nil {
+		return
+	}
+	for _, fields := range all {
+		raw, _ := json.Marshal(fields)
+		r := defaults() // records written by an older version get today's defaults
+		if json.Unmarshal(raw, &r) != nil {
+			continue
+		}
+		store[r.%[2]s] = r
+		for k, v := range fields {
+			if !known[k] {
+				if extras[r.%[2]s] == nil {
+					extras[r.%[2]s] = map[string]json.RawMessage{}
+				}
+				extras[r.%[2]s][k] = v
 			}
 		}
 	}
 }
 
+// save writes shared state, keeping fields this version doesn't know about
+// so a newer version's data survives an older version's write.
 func save() {
 	if dataPath == "" {
 		return
 	}
-	b, _ := json.MarshalIndent(sorted(), "", "  ")
+	var all []map[string]json.RawMessage
+	for _, r := range sorted() {
+		raw, _ := json.Marshal(r)
+		var fields map[string]json.RawMessage
+		json.Unmarshal(raw, &fields)
+		for k, v := range extras[r.%[2]s] {
+			if _, ok := fields[k]; !ok {
+				fields[k] = v
+			}
+		}
+		all = append(all, fields)
+	}
+	b, _ := json.MarshalIndent(all, "", "  ")
 	tmp := dataPath + ".tmp"
 	if os.WriteFile(tmp, b, 0o644) == nil {
 		os.Rename(tmp, dataPath)
@@ -260,8 +291,6 @@ func apply(rec *%[1]s, raw map[string]json.RawMessage) string {
 			fail(w, 400, msg)
 			return
 		}
-		mu.Lock()
-		defer mu.Unlock()
 		if _, exists := store[rec.%[2]s]; exists {
 			fail(w, 409, fmt.Sprintf("%[3]s %%s already exists", rec.%[2]s))
 			return
@@ -272,14 +301,10 @@ func apply(rec *%[1]s, raw map[string]json.RawMessage) string {
 	})
 
 	mux.HandleFunc("GET %[1]s", func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		defer mu.Unlock()
 		reply(w, 200, sorted())
 	})
 
 	mux.HandleFunc("GET %[1]s/{key}", func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		defer mu.Unlock()
 		rec, ok := store[r.PathValue("key")]
 		if !ok {
 			fail(w, 404, fmt.Sprintf("%[3]s %%s not found", r.PathValue("key")))
@@ -295,8 +320,6 @@ func apply(rec *%[1]s, raw map[string]json.RawMessage) string {
 			fail(w, 400, msg)
 			return
 		}
-		mu.Lock()
-		defer mu.Unlock()
 		rec, ok := store[key]
 		if !ok {
 			fail(w, 404, fmt.Sprintf("%[3]s %%s not found", key))
@@ -321,8 +344,6 @@ func apply(rec *%[1]s, raw map[string]json.RawMessage) string {
 
 	mux.HandleFunc("DELETE %[1]s/{key}", func(w http.ResponseWriter, r *http.Request) {
 		key := r.PathValue("key")
-		mu.Lock()
-		defer mu.Unlock()
 		rec, ok := store[key]
 		if !ok {
 			fail(w, 404, fmt.Sprintf("%[3]s %%s not found", key))
@@ -353,6 +374,7 @@ func apply(rec *%[1]s, raw map[string]json.RawMessage) string {
 		w("\t\tif %s {\n\t\t\tfail(w, 409, %q)\n\t\t\treturn\n\t\t}\n", cond, msg)
 	}
 	w(`		delete(store, key)
+		delete(extras, key)
 		save()
 		reply(w, 204, nil)
 	})
@@ -366,9 +388,13 @@ func apply(rec *%[1]s, raw map[string]json.RawMessage) string {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	load()
 	fmt.Printf("LISTENING http://%%s\n", ln.Addr())
-	http.Serve(ln, mux)
+	http.Serve(ln, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		load()
+		mux.ServeHTTP(w, r)
+	}))
 }
 `)
 	return b.String()
