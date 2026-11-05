@@ -146,6 +146,11 @@ type entry struct {
 	reason string
 	stats  *stats
 	looks  int // evaluations with enough data, for alpha spending
+	// baseline is the champion this challenger was admitted against.
+	// Guardrails measure harm against it: what customers would have got
+	// had the experiment never run. A later, better champion makes a
+	// challenger "worse", not "harmful".
+	baseline *entry
 }
 
 // Population is a champion and its challengers.
@@ -233,7 +238,7 @@ func (p *Population) Propose(ctx context.Context, v Variant) (counterfactual.Rep
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	e := &entry{v: v, status: Challenger, stats: newStats()}
+	e := &entry{v: v, status: Challenger, stats: newStats(), baseline: p.champion}
 	if !rep.Promote() {
 		e.status, e.reason = Rejected, strings.Join(rep.Blockers, "; ")
 	}
@@ -405,9 +410,9 @@ func (v Verdict) String() string {
 
 // Evaluate judges every challenger with enough outcomes, in this order:
 //
-//  1. A guardrail whose observed average is breached, significantly
-//     (GuardrailAlpha), retires the challenger and, with AutoRewind,
-//     rewinds its decision.
+//  1. A guardrail breached significantly (GuardrailAlpha) against the
+//     champion the challenger was admitted against retires it and, with
+//     AutoRewind, rewinds its decision.
 //  2. A challenger significantly better on the objective (Alpha), by at
 //     least MinLiftPct, is a promotion candidate; the best one wins.
 //  3. One significantly worse is retired; its actions stand.
@@ -432,7 +437,11 @@ func (p *Population) Evaluate(ctx context.Context) (Verdict, error) {
 	var outcomes []decision.Outcome
 
 	for _, e := range p.challengers() {
-		if e.stats.n < p.opts.MinSamples || champ.stats.n < p.opts.MinSamples {
+		base := e.baseline
+		if base == nil {
+			base = champ
+		}
+		if e.stats.n < p.opts.MinSamples || champ.stats.n < p.opts.MinSamples || base.stats.n < p.opts.MinSamples {
 			verdict.Waiting = append(verdict.Waiting, Pending{e.v.Name,
 				fmt.Sprintf("%d/%d outcomes (champion %d)", e.stats.n, p.opts.MinSamples, champ.stats.n)})
 			continue
@@ -449,7 +458,7 @@ func (p *Population) Evaluate(ctx context.Context) (Verdict, error) {
 			})
 		}
 
-		ms := compare(champ.stats.means(), e.stats.means())
+		ms := compare(base.stats.means(), e.stats.means())
 		var breaches, suspected []string
 		for _, g := range p.opts.Guardrails {
 			msg := g.Check(ms)
@@ -459,9 +468,9 @@ func (p *Population) Evaluate(ctx context.Context) (Verdict, error) {
 			msg = strings.Replace(msg, "predicted ", "observed ", 1)
 			var pv float64
 			if g.Rise {
-				pv = pGreater(e.stats.metrics[g.Metric], champ.stats.metrics[g.Metric])
+				pv = pGreater(e.stats.metrics[g.Metric], base.stats.metrics[g.Metric])
 			} else {
-				pv = pGreater(champ.stats.metrics[g.Metric], e.stats.metrics[g.Metric])
+				pv = pGreater(base.stats.metrics[g.Metric], e.stats.metrics[g.Metric])
 			}
 			if pv < galpha {
 				breaches = append(breaches, fmt.Sprintf("%s, p=%.2g", msg, pv))

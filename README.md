@@ -15,7 +15,9 @@ It explores a larger idea: software built for agents, where intent and consequen
 | **Counterfactual runtime** | `reversible/counterfactual` | *What would this change do, and what would happen?* | `Replay`, `ReplayWith` + `Simulators` |
 | **Intent compiler** | `reversible/intent` | *What does the human actually want?* | `Parse`, `Compile` → checks or questions |
 | **Evolutionary runtime** | `reversible/evolve` | *Which version is actually better, with evidence?* | `Propose`, `Serve`, `Observe`, `Evaluate` |
-| **Synthesis loop** | `reversible/synth` | *What should we try next?* | `Generator`, `ParamSearch`, `Loop.Step` |
+| **Synthesis loop** | `reversible/synth` | *What should we try next?* | `Generator`, `ParamSearch`, `ModelGenerator`, `Loop.Step` |
+| **Policy language** | `reversible/policy` | *How can a model write behaviour safely?* | `Parse`, `Validate`, `Compile` |
+| **Model client** | `reversible/model` | *How do we talk to the model?* | `Completer`, `Anthropic`, `ExtractJSON` |
 
 ```
 goal ─▶ decision ─▶ decision ─▶ intent ─▶ effects ─▶ world
@@ -52,12 +54,32 @@ go run ./cmd/autopilot
 ```
 round  1  [   550 customers]  champion $55   propose $52; propose $58
 round  2  [  1050 customers]  champion $52   PROMOTE $52 over $55 (+7.4%, p=0.00032)
-round  3  [  1550 customers]  champion $52   propose $49; retire $58 (guardrail breach), rewound 365 charges
-round 15  [  7550 customers]  champion $52   retire $49 (inconclusive)
-round 16  converged: no untried neighbour of $52 is left, nothing is running
+round  3  [  1550 customers]  champion $52   propose $49
+round  5  [  2550 customers]  champion $52   retire $58 (worse on objective)
+round 16  [  8050 customers]  champion $52   retire $49 (inconclusive)
+round 17  converged: no untried neighbour of $52 is left, nothing is running
 ```
 
 The synthesis loop searches prices inside the spec's approved range, one step from the champion at a time. The true revenue-maximising price ($50, which nothing in the system is told) lies between its grid points; it settles on $52, and correctly calls $49 a statistical tie (the true gap is under 1%).
+
+And with a model designing whole policies, not just prices:
+
+```sh
+go run ./cmd/designer                          # offline stand-in
+ANTHROPIC_API_KEY=sk-... go run ./cmd/designer # Claude designs the policy
+go run ./cmd/designer -show-prompt             # see exactly what the model is told
+```
+
+Customers' willingness to pay depends on how long they've subscribed, which nobody tells the system. Starting from a flat $55, the designer proposes splitting price by tenure, then refines each segment; one rule-breaking idea ($120 for everyone) is stopped by the gate before a customer sees it. Measured on 40,000 customers the system never saw:
+
+| Policy | Revenue per customer |
+|---|---|
+| Starting policy, flat $55 | $25.14 |
+| Best possible single price ($42), the ceiling for any price-only search | $35.96 |
+| **Designed policy** (new $35, mid $45, loyal $70) | **$42.37** |
+| True per-segment optimum ($35/$45/$60) | $43.86 |
+
+Without an API key the demo uses an offline stand-in: a deterministic heuristic that reads the same prompt and replies in the same JSON, so the demo is reproducible. It is labelled as such every time it runs.
 
 ## The effect system
 
@@ -392,6 +414,47 @@ for {
 
 `ParamSearch` tries the champion's untried neighbours within the spec's bounds. The `Generator` interface is where a language model plugs in, proposing whole new programs from the compiled spec and the trial history. The safety story doesn't change with the generator: a rogue generator that proposes something outside the spec is stopped by the gate (there's a test for exactly that).
 
+## Models that write policies
+
+`ModelGenerator` lets a language model propose whole behaviours, safely:
+
+```go
+gen := &synth.ModelGenerator{
+    Model:    anthropicClient,           // or any model.Completer
+    Spec:     spec,                      // goal, rules (with their "why"), guardrails
+    Registry: reg,                       // which effect types exist
+    Examples: someRecordedRequests,      // which inputs exist
+}
+gen.Register("flat-55", startingPolicy)
+loop, _ := synth.New(pop, gen, ledger, nil, synth.Options{Goal: "goal", Actor: "designer"})
+```
+
+Every prompt contains the goal and every rule's `why`, the guardrails, the registered effect types, example requests, the policy language, the champion's policy, and every trial so far with its observed outcomes, hypothesis and result. The model replies with JSON.
+
+**The model writes data, not code.** Each proposal is a `policy.Policy`: named variables plus ordered rules whose conditions on request inputs choose the effects to plan.
+
+```json
+{
+  "vars": {"new": 35, "mid": 45, "loyal": 70},
+  "rules": [
+    {"when": [{"input": "tenure_months", "op": "<", "value": "6"}],
+     "effects": [{"name": "charge", "type": "card.charge", "params": {"customer": "${input.customer}", "amount": "${var.new}"}},
+                 {"name": "receipt", "type": "email.send", "params": {"to": "${input.customer}"}}]},
+    {"when": [{"input": "tenure_months", "op": ">=", "value": "24"}],
+     "effects": [/* ... ${var.loyal} ... */]},
+    {"effects": [/* ... ${var.mid} ... */]}
+  ]
+}
+```
+
+A policy can't run code, reach the network or use an effect type that isn't registered. `policy.Validate` reports every problem at once. A proposal that doesn't parse or validate still becomes a candidate whose program fails, so the gate rejects it **on the record**: the ledger keeps what the model tried and why it was refused. Model and parse failures surface as errors, never as "nothing left to try". Every prompt and reply is kept for audit (`gen.Transcript()`).
+
+`model.Anthropic` is a dependency-free client for the Messages API (`model.FromEnv()` reads `ANTHROPIC_API_KEY` and an optional `REVERSIBLE_MODEL`).
+
+### Harm is measured against the launch baseline
+
+A challenger's guardrails compare it with the champion it was **admitted against**: what customers would have got had the experiment never run. Its objective compares it with the **current** champion. So a challenger that was fine when launched, but is outclassed by a later winner, is retired as *worse* (its customers keep the valid price they paid), not rewound as *harmful*. The designer demo found this: before the fix, a policy that beat the original was rewound, refunding 2,759 valid charges, because its churn looked high next to a newer champion.
+
 ## Run the in-memory demo
 
 ```sh
@@ -428,7 +491,8 @@ The demo walks an agent through onboarding customers against a fake world:
 - **Statistics are frequentist and conservative.** Welch's t-test with a union-bound alpha spend is sound but slow; group-sequential or Bayesian designs would reach decisions with fewer customers. Metrics are tested one at a time, with no correction across guardrails.
 - **The search is local.** `ParamSearch` walks a fixed grid one step at a time, so it can stop between grid points (as it does at $52 vs the true $50) or in a local optimum.
 - **Programs must be pure.** Replay assumes a `Program` only describes effects. One that performs I/O while deciding will do it during replay too.
-- **No model-backed generator ships.** The `Generator` interface is ready for one, but only `ParamSearch` is included.
+- **The live-model path is tested against a mock API, not a live model.** The client, prompt and parsing are covered by tests and the offline stand-in; how well a given Claude model designs policies is for you to try with your key.
+- **The policy language is deliberately small.** Conditions are conjunctions of comparisons; there's no arithmetic in params and no state across requests.
 - **Keys are in memory.** The keyring has no persistence, rotation or revocation.
 - **Single machine.** File locking is advisory and Unix-only; there's no distributed coordination across services.
 
@@ -436,7 +500,8 @@ The demo walks an agent through onboarding customers against a fake world:
 
 The loop is closed: a person writes intent; the system proposes, gates, runs, judges, rewinds and learns, and every step is signed. What's left is making each part stronger:
 
-- **A model-backed generator.** Propose whole programs, not just knob settings, from the compiled spec and the trial history.
+- **Model-proposed experiments with memory.** Let the model see calibration results and per-segment outcomes, not just averages.
+- **A richer policy language.** Arithmetic in params, segment-level metrics, and policies that compose.
 - **Adaptive search.** Shrink the step near an optimum, and explore beyond local maxima.
 - **Better simulators.** Per-segment calibration, uncertainty estimates, and gates that use the uncertainty.
 - **Faster, sound decisions.** Group-sequential or Bayesian evaluation; multiple-testing correction across guardrails.

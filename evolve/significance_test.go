@@ -127,3 +127,43 @@ func TestServedPredictionsFeedTheCalibrator(t *testing.T) {
 		t.Fatalf("calibration didn't help: %+v", corr)
 	}
 }
+
+// A challenger that was fine against the champion it launched against
+// must not be rewound just because a later champion is much better.
+func TestGuardrailsMeasureHarmAgainstTheLaunchBaseline(t *testing.T) {
+	f := newFixture(t, true)
+	f.serve(t, 0, 10, priceOf)
+	f.propose(t, "pA", priced(f.reg, 41))
+	f.propose(t, "pB", priced(f.reg, 42))
+	// Hand-crafted outcomes: champion p40 churns 30%, A 25% (better), B 5%
+	// and far more revenue. Noise keeps variances non-zero.
+	metrics := map[string][2]float64{"p40": {50, 0.30}, "pA": {52, 0.25}, "pB": {80, 0.05}}
+	observe := func(from, n int) {
+		for i := from; i < from+n; i++ {
+			req := counterfactual.Request{ID: fmt.Sprintf("g%05d", i)}
+			v, _, err := f.pop.Serve(context.Background(), f.rt, req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			m := metrics[v.Name]
+			churn := 0.0
+			if float64(i%100) < m[1]*100 {
+				churn = 1
+			}
+			f.pop.Observe(req.ID, map[string]float64{"revenue": m[0] + float64(i%3), "churn": churn})
+		}
+	}
+	observe(0, 300)
+	v, _ := f.pop.Evaluate(context.Background())
+	if v.Promoted != "pB" {
+		t.Fatalf("setup: expected pB promoted: %s", v)
+	}
+	observe(300, 600)
+	v, _ = f.pop.Evaluate(context.Background())
+	if len(v.Retired) != 1 || v.Retired[0].Variant != "pA" {
+		t.Fatalf("verdict: %s", v)
+	}
+	if v.Retired[0].Kind != Worse || v.Retired[0].Rewind != nil {
+		t.Fatalf("pA should be retired as worse, not rewound as harmful: %s", v)
+	}
+}

@@ -33,8 +33,14 @@ jobs:
           grep -q "rejected by the calibrated gate" evo.txt
           go run ./cmd/autopilot | tee auto.txt
           grep -q "converged" auto.txt
-          grep -q "rewound" auto.txt
+          grep -q 'retire \$58' auto.txt
           grep -q "chain verifies" auto.txt
+          go run ./cmd/designer | tee designer.txt
+          grep -q "offline stand-in" designer.txt
+          grep -q "premium-120 rejected by the gate" designer.txt
+          grep -q "PROMOTE tiered" designer.txt
+          grep -q "converged" designer.txt
+          grep -q "chain verifies" designer.txt
       - name: crash-recovery smoke test
         run: |
           go build -o agentctl ./cmd/agentctl
