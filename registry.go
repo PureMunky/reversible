@@ -61,6 +61,17 @@ func (r *Registry) MustRegister(typ string, h Handler) {
 	}
 }
 
+// Types lists every registered effect type and its class.
+func (r *Registry) Types() map[string]Class {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make(map[string]Class, len(r.handlers))
+	for t, h := range r.handlers {
+		out[t] = h.Class
+	}
+	return out
+}
+
 // Effect builds a named, serializable effect of a registered type.
 func (r *Registry) Effect(name, typ string, p Params) (Effect, error) {
 	return r.build(name, "", Spec{Type: typ, Params: p})
