@@ -17,9 +17,11 @@ package evolve
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"sort"
 	"strings"
 	"sync"
@@ -76,6 +78,9 @@ type Options struct {
 	// looser than Alpha, because stopping harm early matters more than
 	// being sure.
 	GuardrailAlpha float64
+	// Salt keys traffic assignment. Leave it empty for a random salt; set
+	// it only to reproduce an assignment exactly (for example in tests).
+	Salt string
 	// Calibrator, if set (with Gate.Simulators), receives a prediction for
 	// every served request paired with its observed outcome, and the gate
 	// uses its latest fit for every new proposal.
@@ -152,6 +157,7 @@ type Population struct {
 	order     []string
 	served    map[string]string             // request ID -> variant name
 	predicted map[string]map[string]float64 // request ID -> raw simulator prediction
+	salt      [16]byte
 	rounds    int
 }
 
@@ -182,8 +188,15 @@ func New(champion Variant, opts Options) (*Population, error) {
 		return nil, errors.New("AutoRewind needs a Ledger and an Undoer")
 	}
 	e := &entry{v: champion, status: Champion, stats: newStats()}
-	return &Population{opts: opts, champion: e, entries: map[string]*entry{champion.Name: e},
-		order: []string{champion.Name}, served: map[string]string{}, predicted: map[string]map[string]float64{}}, nil
+	p := &Population{opts: opts, champion: e, entries: map[string]*entry{champion.Name: e},
+		order: []string{champion.Name}, served: map[string]string{}, predicted: map[string]map[string]float64{}}
+	if opts.Salt != "" {
+		sum := sha256.Sum256([]byte(opts.Salt))
+		copy(p.salt[:], sum[:16])
+	} else if _, err := rand.Read(p.salt[:]); err != nil {
+		return nil, err
+	}
+	return p, nil
 }
 
 // Propose runs a candidate through the replay gate against the current
@@ -229,8 +242,20 @@ func (p *Population) Propose(ctx context.Context, v Variant) (counterfactual.Rep
 	return rep, nil
 }
 
-// Route picks the variant for a request. Assignment is a stable hash of the
-// request ID, so retries land on the same variant.
+// bucket hashes a request ID with the population's secret salt. Keyed
+// SHA-256 makes assignment independent of any other hash of the same ID
+// (a customer-trait hash, a shard key), which a plain hash like FNV is
+// not: a correlated assignment is selection bias, and it produces
+// confident, wrong verdicts.
+func (p *Population) bucket(id string) uint64 {
+	h := sha256.New()
+	h.Write(p.salt[:])
+	h.Write([]byte(id))
+	return binary.BigEndian.Uint64(h.Sum(nil))
+}
+
+// Route picks the variant for a request. Assignment is a stable keyed hash
+// of the request ID, so retries land on the same variant.
 func (p *Population) Route(req counterfactual.Request) Variant {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -242,9 +267,7 @@ func (p *Population) route(req counterfactual.Request) *entry {
 	if len(chs) == 0 {
 		return p.champion
 	}
-	h := fnv.New64a()
-	h.Write([]byte(req.ID))
-	x := h.Sum64()
+	x := p.bucket(req.ID)
 	if float64(x%10000)/10000 >= p.opts.ChallengerShare {
 		return p.champion
 	}

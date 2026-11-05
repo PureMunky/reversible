@@ -132,7 +132,11 @@ func betaCF(a, b, x float64) float64 {
 }
 
 // spend returns the significance threshold for the k-th look (k ≥ 1) at
-// the data: alpha/2, alpha/4, alpha/8, ... Because these sum to alpha,
-// peeking after every batch can't inflate the overall false-positive rate
-// (a union bound; conservative, but sound).
-func spend(alpha float64, k int) float64 { return alpha / math.Pow(2, float64(k)) }
+// the data: 6α/(π²k²). These sum to α over all looks, so peeking after
+// every batch can't inflate the overall false-positive rate (a union
+// bound). It decays polynomially, so a real effect can still reach
+// significance after many looks; halving per look (α/2, α/4, ...) makes
+// that nearly impossible after ten or so.
+func spend(alpha float64, k int) float64 {
+	return 6 * alpha / (math.Pi * math.Pi * float64(k) * float64(k))
+}

@@ -191,6 +191,7 @@ func main() {
 		Objective:       evolve.Objective{Metric: "revenue", Maximize: true, MinLiftPct: 2},
 		Guardrails:      compiled.Guardrails,
 		MinSamples:      60,
+		Salt:            "evolution-demo",
 		Calibrator:      calibrator,
 		Ledger:          g, AutoRewind: true, Undoer: rt, Actor: "evolve",
 	})
@@ -260,7 +261,7 @@ func main() {
 	}
 	fmt.Printf("   customers on $65 after auto-rewind: %d   (their charges and receipts were never released)\n", held)
 	fmt.Println("   the simulator predicted $65 was safe; reality disagreed, and reality won")
-	fmt.Println("   $52 looks better, but a +2.7% edge on 131 customers could be luck, so it keeps running")
+	fmt.Println("   $52's first customers aren't conclusive either way, so it keeps running instead of being judged on luck")
 
 	head("6 · More customers arrive until the data is conclusive")
 	for round := 1; round <= 20 && verdict.Promoted == "" && len(verdict.Waiting) > 0; round++ {

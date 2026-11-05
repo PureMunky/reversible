@@ -14,7 +14,8 @@ It explores a larger idea: software built for agents, where intent and consequen
 | **Decision ledger** | `reversible/decision` | *Why did it happen, and who decided?* | `Decide`, `Explain`, `Rewind`, `ChainLog` |
 | **Counterfactual runtime** | `reversible/counterfactual` | *What would this change do, and what would happen?* | `Replay`, `ReplayWith` + `Simulators` |
 | **Intent compiler** | `reversible/intent` | *What does the human actually want?* | `Parse`, `Compile` → checks or questions |
-| **Evolutionary runtime** | `reversible/evolve` | *Which version is actually better?* | `Propose`, `Serve`, `Observe`, `Evaluate` |
+| **Evolutionary runtime** | `reversible/evolve` | *Which version is actually better, with evidence?* | `Propose`, `Serve`, `Observe`, `Evaluate` |
+| **Synthesis loop** | `reversible/synth` | *What should we try next?* | `Generator`, `ParamSearch`, `Loop.Step` |
 
 ```
 goal ─▶ decision ─▶ decision ─▶ intent ─▶ effects ─▶ world
@@ -40,7 +41,23 @@ And the second layer, from human intent to self-correcting production:
 go run ./cmd/evolution
 ```
 
-Phil writes an intent spec; the compiler sends back questions instead of guessing (a mistyped effect type, impossible bounds, a metric nothing predicts). The fixed spec gates five variants proposed by a pricing agent: two break the spec's rules, one is predicted to drive churn up 80%. Two get live traffic. Real outcomes promote **$52** (lower price, more revenue) and retire **$65**, which the simulator thought was safe; its decision is rewound automatically and 146 customers go back to the champion's price before their charges are ever released. Every step is in a signed, hash-chained ledger that detects a rewritten rationale.
+Phil writes an intent spec; the compiler sends back questions instead of guessing (a mistyped effect type, impossible bounds, a metric nothing predicts). The fixed spec gates five variants proposed by a pricing agent: two break the spec's rules, one is predicted to drive churn up too far. Two get live traffic. **$65**, which the simulator thought was safe, breaches the churn guardrail; its decision is rewound automatically and its customers are restored before any charge is released. **$52** looks *worse* at first, so it keeps running instead of being judged on luck; after 11,000 more customers it's promoted at p = 0.0001. Meanwhile the simulator calibrates itself against every outcome, and when the agent tries $65 again, the calibrated gate rejects it. Every step is in a signed, hash-chained ledger that detects a rewritten rationale.
+
+And with no human in the loop after the spec is written:
+
+```sh
+go run ./cmd/autopilot
+```
+
+```
+round  1  [   550 customers]  champion $55   propose $52; propose $58
+round  2  [  1050 customers]  champion $52   PROMOTE $52 over $55 (+7.4%, p=0.00032)
+round  3  [  1550 customers]  champion $52   propose $49; retire $58 (guardrail breach), rewound 365 charges
+round 15  [  7550 customers]  champion $52   retire $49 (inconclusive)
+round 16  converged: no untried neighbour of $52 is left, nothing is running
+```
+
+The synthesis loop searches prices inside the spec's approved range, one step from the champion at a time. The true revenue-maximising price ($50, which nothing in the system is told) lies between its grid points; it settles on $52, and correctly calls $49 a statistical tie (the true gap is under 1%).
 
 ## The effect system
 
@@ -325,6 +342,56 @@ _, err := decision.NewChainLog(decision.NewFileLog("decisions.jsonl"), keys.Publ
 
 An actor with no signing key can't record a decision at all. Verification catches edited content, deleted or reordered records, re-attribution to another actor, and signatures forged with the wrong key, and `NewChainLog` refuses to extend a broken chain.
 
+### Calibration: simulators learn from reality
+
+A `Calibrator` pairs what the simulators predicted for each served request with what was then observed, and fits a per-metric linear correction. The gate then uses corrected predictions:
+
+```go
+cal := counterfactual.NewCalibrator()
+cal.Bounds = map[string][2]float64{"churn": {0, 1}}
+pop, _ := evolve.New(champion, evolve.Options{Gate: gate, Calibrator: cal /* ... */})
+// every Serve records a prediction; every Observe pairs it with reality;
+// every Propose gates with cal.Fit()
+fmt.Print(pop.Calibration())
+// churn    n=12680  observed ≈ -0.299 + 7.28 × predicted, error (RMSE) 0.287 → 0.284
+```
+
+Two safeguards keep it from learning noise, both found the hard way (an early version fitted a slope to single-price data, extrapolated it, and rejected every proposal, locking the system into the status quo):
+
+- **A learned slope must be real.** It's only used if statistically distinguishable from 1 (|t| ≥ 2). Otherwise only a level shift is applied. Data from one operating point can say the model is off, not how it responds to change.
+- **No extrapolation.** Outside the range of predictions it was fitted on, the edge correction is held and the raw model's slope takes over.
+
+### Sound evaluation
+
+`Evaluate` decides on evidence, not averages:
+
+- **Welch's t-test** on every comparison (running mean and variance per metric per variant).
+- **Alpha spending.** Each challenger's α is spent across evaluations as 6α/(π²k²), which sums to α. Evaluating after every batch can't inflate false positives, and a real effect can still reach significance after many looks.
+- **Separate budgets.** Promotions use `Alpha` (default 0.05). Guardrail breaches use the looser `GuardrailAlpha` (default 0.10), because stopping harm early matters more than certainty. A suspected but unconfirmed breach blocks promotion.
+- **Four outcomes.** Promote (significantly better by `MinLiftPct`). Retire for a **guardrail breach** (rewound with `AutoRewind`). Retire as **worse** (its actions were within bounds, so they stand). Retire as **inconclusive** at `MaxSamples`.
+- **Unbiased assignment.** Traffic is split by a keyed SHA-256 of the request ID under a per-population salt. An earlier FNV-based split was correlated with another FNV hash of the same ID used in the demo world, which made a worse price look significantly better (p = 0.0026). Any hash of the ID used elsewhere could do the same; a keyed hash can't.
+
+## The synthesis loop
+
+`synth.Loop` proposes variants itself. A `Generator` sees the champion and every trial so far and returns candidates; each one is recorded as a signed decision with its rationale, then handed to the population, which gates, runs, judges and (if needed) rewinds it.
+
+```go
+knob := synth.KnobFromSpec(spec, "price", "card.charge", "amount", 3, 0, 1000) // bounds from the spec
+loop, _ := synth.New(pop, synth.ParamSearch{
+    Knobs:   []synth.Knob{knob},
+    Factory: func(p synth.Point) counterfactual.Program { return pricing(int(p["price"])) },
+}, ledger, synth.Point{"price": 55}, synth.Options{Goal: "goal", Actor: "synth", MaxLive: 2})
+
+for {
+    rep, _ := loop.Step(ctx)   // top up to MaxLive challengers
+    if rep.Converged { break } // nothing left to try, nothing running
+    serveTraffic()
+    pop.Evaluate(ctx)
+}
+```
+
+`ParamSearch` tries the champion's untried neighbours within the spec's bounds. The `Generator` interface is where a language model plugs in, proposing whole new programs from the compiled spec and the trial history. The safety story doesn't change with the generator: a rogue generator that proposes something outside the spec is stopped by the gate (there's a test for exactly that).
+
 ## Run the in-memory demo
 
 ```sh
@@ -357,22 +424,24 @@ The demo walks an agent through onboarding customers against a fake world:
 - **Reconcile is only as good as the downstream system.** It works when the world can be queried by idempotency key. Systems that can't (fire-and-forget email, some legacy APIs) leave steps uncertain.
 - **Three logs, not one.** The effect store (source of truth for recovery), the effect ledger (audit trail) and the decision log are separate files. They're linked by intent ID, but not written atomically together.
 - **Compensation is trusted.** An `Undo` that lies or partially succeeds isn't detected. Verifying that compensation actually restored the prior state is an open problem.
-- **Simulators are only as good as their models.** Predictions are summed per effect; there's no interaction between effects or customers, and no uncertainty estimate.
-- **Evaluation is naive statistics.** `Evaluate` compares means after `MinSamples`, with no significance test or sequential correction. Fine for a prototype, risky for real money.
+- **Simulators are only as good as their models.** Predictions are summed per effect, with no interaction effects or uncertainty estimate. Calibration corrects a model's level and (with evidence) its slope on one aggregate prediction; it can't fix a model with the wrong structure.
+- **Statistics are frequentist and conservative.** Welch's t-test with a union-bound alpha spend is sound but slow; group-sequential or Bayesian designs would reach decisions with fewer customers. Metrics are tested one at a time, with no correction across guardrails.
+- **The search is local.** `ParamSearch` walks a fixed grid one step at a time, so it can stop between grid points (as it does at $52 vs the true $50) or in a local optimum.
 - **Programs must be pure.** Replay assumes a `Program` only describes effects. One that performs I/O while deciding will do it during replay too.
-- **The intent compiler compiles to checks, not programs.** It turns a spec into what candidates must satisfy; generating candidate programs from the spec (e.g. with a model) is left to the caller.
+- **No model-backed generator ships.** The `Generator` interface is ready for one, but only `ParamSearch` is included.
 - **Keys are in memory.** The keyring has no persistence, rotation or revocation.
 - **Single machine.** File locking is advisory and Unix-only; there's no distributed coordination across services.
 
 ## Where this is going
 
-Both layers are in place: effects, decisions and replay underneath; intent, simulation, evolution and accountability on top. What's left is closing the loop:
+The loop is closed: a person writes intent; the system proposes, gates, runs, judges, rewinds and learns, and every step is signed. What's left is making each part stronger:
 
-- **Program synthesis from intent.** Have a model propose candidate programs directly from a compiled spec, then let the gate and evolution do the rest.
-- **Simulator calibration.** Compare predictions with observed outcomes per variant and correct the models automatically (the `$65` case in `cmd/evolution` is exactly the gap to close).
-- **Sound evaluation.** Sequential testing so promotions and retirements carry real confidence.
-- **Contract negotiation.** Agents agreeing interfaces at runtime, checked by the same replay gate.
-- **Distributed effects.** Coordinated escrow and rewind across services, not just within one process.
+- **A model-backed generator.** Propose whole programs, not just knob settings, from the compiled spec and the trial history.
+- **Adaptive search.** Shrink the step near an optimum, and explore beyond local maxima.
+- **Better simulators.** Per-segment calibration, uncertainty estimates, and gates that use the uncertainty.
+- **Faster, sound decisions.** Group-sequential or Bayesian evaluation; multiple-testing correction across guardrails.
+- **Contract negotiation.** Agents agreeing interfaces at runtime, checked by the same gate.
+- **Distributed effects.** Coordinated escrow and rewind across services.
 
 ## License
 

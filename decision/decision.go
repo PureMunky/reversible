@@ -261,7 +261,11 @@ func (g *Graph) Explain(id string) (string, error) {
 			fmt.Fprintf(&b, "%s    observed: %s\n", indent, formatMetrics(n.Metrics))
 		}
 		if len(n.Executions) > 0 {
-			fmt.Fprintf(&b, "%s    executed: %s\n", indent, strings.Join(n.Executions, ", "))
+			shown, more := n.Executions, ""
+			if len(shown) > 5 {
+				shown, more = shown[:5], fmt.Sprintf(" (+%d more)", len(n.Executions)-5)
+			}
+			fmt.Fprintf(&b, "%s    executed: %s%s\n", indent, strings.Join(shown, ", "), more)
 		}
 	}
 	return b.String(), nil

@@ -80,6 +80,7 @@ func newFixture(t *testing.T, auto bool) *fixture {
 		Objective:       Objective{Metric: "revenue", Maximize: true, MinLiftPct: 5},
 		Guardrails:      []counterfactual.Guardrail{counterfactual.NoRiseOver("churn", 10)},
 		MinSamples:      20,
+		Salt:            "evolve-test",
 		Ledger:          g, AutoRewind: auto, Undoer: rt, Actor: "evolve",
 	})
 	if err != nil {

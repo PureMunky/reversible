@@ -31,6 +31,10 @@ jobs:
           grep -q "customers on \$65 after auto-rewind: 0" evo.txt
           grep -q "chain verifies" evo.txt
           grep -q "rejected by the calibrated gate" evo.txt
+          go run ./cmd/autopilot | tee auto.txt
+          grep -q "converged" auto.txt
+          grep -q "rewound" auto.txt
+          grep -q "chain verifies" auto.txt
       - name: crash-recovery smoke test
         run: |
           go build -o agentctl ./cmd/agentctl
