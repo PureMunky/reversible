@@ -164,3 +164,15 @@ func mergeForAttack(real, evil *Keyring) *Keyring {
 	}
 	return k
 }
+
+func TestMemoryLogLoadReturnsCopies(t *testing.T) {
+	log := NewMemoryLog()
+	g, _ := Open(log)
+	g.Goal("g", "original", "phil")
+	recs, _ := log.Load()
+	recs[0].Node.Summary = "rewritten"
+	again, _ := log.Load()
+	if again[0].Node.Summary != "original" {
+		t.Fatal("Load leaked a pointer into stored history")
+	}
+}

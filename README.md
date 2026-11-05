@@ -6,13 +6,15 @@
 
 It explores a larger idea: software built for agents, where intent and consequences are the primary artifacts and code is something that gets regenerated in between.
 
-## Three layers
+## Layers
 
 | Layer | Package | Answers | Key operation |
 |---|---|---|---|
 | **Effect system** | `reversible` | *What happened, and can it be undone?* | `Execute`, `Undo`, `Release`, `Recover` |
-| **Decision ledger** | `reversible/decision` | *Why did it happen?* | `Decide`, `Explain`, `Rewind` |
-| **Counterfactual runtime** | `reversible/counterfactual` | *What would this change have done?* | `Record`, `Replay` → verdict |
+| **Decision ledger** | `reversible/decision` | *Why did it happen, and who decided?* | `Decide`, `Explain`, `Rewind`, `ChainLog` |
+| **Counterfactual runtime** | `reversible/counterfactual` | *What would this change do, and what would happen?* | `Replay`, `ReplayWith` + `Simulators` |
+| **Intent compiler** | `reversible/intent` | *What does the human actually want?* | `Parse`, `Compile` → checks or questions |
+| **Evolutionary runtime** | `reversible/evolve` | *Which version is actually better?* | `Propose`, `Serve`, `Observe`, `Evaluate` |
 
 ```
 goal ─▶ decision ─▶ decision ─▶ intent ─▶ effects ─▶ world
@@ -31,6 +33,14 @@ go run ./cmd/storyline
 ```
 
 A pricing agent decides to move customers to annual plans and acts on it. Phil asks *why* one customer ended up on a credit plan and gets the full chain of reasoning. Phil rewinds the decision: five intents across two decisions are undone, newest first, and the one email that can't be unsent is flagged. The agent then proposes v2 pricing, which replay blocks (a new one-way door and a broken invariant); v3 passes.
+
+And the second layer, from human intent to self-correcting production:
+
+```sh
+go run ./cmd/evolution
+```
+
+Phil writes an intent spec; the compiler sends back questions instead of guessing (a mistyped effect type, impossible bounds, a metric nothing predicts). The fixed spec gates five variants proposed by a pricing agent: two break the spec's rules, one is predicted to drive churn up 80%. Two get live traffic. Real outcomes promote **$52** (lower price, more revenue) and retire **$65**, which the simulator thought was safe; its decision is rewound automatically and 146 customers go back to the champion's price before their charges are ever released. Every step is in a signed, hash-chained ledger that detects a rewritten rationale.
 
 ## The effect system
 
@@ -215,6 +225,106 @@ verdict: BLOCKED
 
 A candidate is blocked when it fails, panics, or produces an intent the runtime would reject on requests the baseline handles; when it *newly* violates an invariant (violations the baseline already had are shown but don't block); when it opens one-way doors the baseline never did (unless the policy allows it); or when it changes more traffic than the blast-radius limit.
 
+### Predicting consequences: world simulators
+
+Replay compares *plans*. Simulators add a model of how the world responds, so the report can show predicted *consequences* and guardrails can act on them:
+
+```go
+rep := counterfactual.ReplayWith(ctx, counterfactual.Config{
+    Requests: reqs, Baseline: v1, Candidate: v2, Invariants: invs,
+    Simulators: counterfactual.Simulators{
+        "card.charge": func(req counterfactual.Request, e counterfactual.PlannedEffect) map[string]float64 {
+            price, _ := strconv.ParseFloat(e.Params["amount"], 64)
+            churn := churnModel(req, price)
+            return map[string]float64{"revenue": price * (1 - churn), "churn": churn}
+        },
+    },
+    Guardrails: []counterfactual.Guardrail{
+        counterfactual.NoDropOver("revenue", 5),
+        counterfactual.NoRiseOver("churn", 10),
+    },
+})
+```
+
+The report gains per-request deltas (`Δ churn +0.15, revenue +25.3`) and predicted totals, and a breached guardrail blocks promotion. Simulators are models and will be wrong; the evolutionary runtime is what checks them against reality.
+
+## The intent compiler
+
+A person states what they want in a spec, and `intent.Compile` turns it into invariants, guardrails and policy:
+
+```json
+{
+  "goal": "maximise subscription revenue without driving customers away",
+  "owner": "phil",
+  "rules": [
+    {"type": "card.charge", "param": "amount", "max": 5000, "why": "finance signs off above $5k"},
+    {"type": "account.purge", "forbid": true, "why": "legal hold on customer data"},
+    {"type": "card.charge", "requires": "email.send", "why": "every charge gets a receipt"}
+  ],
+  "guardrails": [
+    {"metric": "revenue", "no_drop_over_pct": 10},
+    {"metric": "churn", "no_rise_over_pct": 25}
+  ],
+  "policy": {"max_changed_pct": 50}
+}
+```
+
+```go
+spec, _ := intent.Load("intent.json")
+c := intent.Compile(spec, intent.Known{Types: reg.Types(), Metrics: []string{"revenue", "churn"}})
+if !c.Ready() {
+    for _, q := range c.Questions { fmt.Println(q) }   // ask the human; don't guess
+}
+rep := counterfactual.ReplayWith(ctx, c.Config(counterfactual.Config{Requests: reqs, Baseline: v1, Candidate: v2}))
+```
+
+Rules are `forbid`, `min`/`max` on a param, `requires`, `at_most` and `class`; the human's `why` is carried into every violation. The compiler doesn't guess: unknown fields are rejected, and mistyped types or metrics (`did you mean "card.charge"?`), impossible or conflicting bounds, requirements on forbidden types, rules mixing constraints, class mismatches with the registry and missing goals come back as **blocking** questions. Softer issues (no owner, nothing constrained, new one-way doors allowed) come back as **clarify**.
+
+## The evolutionary runtime
+
+`evolve.Population` runs a champion and challengers side by side, and lets outcomes decide:
+
+```go
+pop, _ := evolve.New(evolve.Variant{Name: "$55", Program: v55, Decision: "price-55"}, evolve.Options{
+    Gate:            compiled.Config(counterfactual.Config{Simulators: sims}), // every challenger must pass this
+    Recorder:        counterfactual.NewMemoryRecorder(),
+    ChallengerShare: 0.2,
+    Objective:       evolve.Objective{Metric: "revenue", Maximize: true, MinLiftPct: 2},
+    Guardrails:      compiled.Guardrails,                                       // checked on observed outcomes
+    MinSamples:      60,
+    Ledger: g, AutoRewind: true, Undoer: rt, Actor: "evolve",
+})
+
+pop.Propose(ctx, evolve.Variant{Name: "$52", Program: v52, Decision: "try-52"}) // replay-gated
+pop.Serve(ctx, rt, req)                // stable hash routing; intent linked to the variant's decision
+pop.Observe(req.ID, map[string]float64{"revenue": 52, "churn": 0})
+verdict, _ := pop.Evaluate(ctx)        // promote, retire (+ auto-rewind), or wait
+```
+
+- **No traffic without the gate.** A challenger is replayed against recorded traffic under the same invariants, simulators, guardrails and policy as any change. Rejected variants never serve.
+- **Stable routing.** Requests are assigned by a hash of their ID, so retries land on the same variant.
+- **Outcomes, not predictions, decide.** A challenger that beats the champion's average on the objective by `MinLiftPct` (with `MinSamples` on both sides) becomes champion. One whose observed averages breach a guardrail is retired.
+- **Outcome-aware rewind.** Each evaluation is recorded as an outcome on the variant's decision. With `AutoRewind`, a retired challenger's decision is rewound, undoing every intent it served; without it, the verdict suggests the rewind.
+
+## Accountability: a signed, hash-chained ledger
+
+Wrap any decision log in a `ChainLog` and every record is linked to the previous one by hash and signed (ed25519) by the actor accountable for it:
+
+```go
+keys := decision.NewKeyring()
+keys.Generate("phil"); keys.Generate("pricing-agent")
+keys.Default = "phil"                                   // signs records with no actor (e.g. outcomes)
+
+chain, _ := decision.NewChainLog(decision.NewFileLog("decisions.jsonl"), keys)
+g, _ := decision.Open(chain)
+
+// Later, anyone with only the public keys:
+_, err := decision.NewChainLog(decision.NewFileLog("decisions.jsonl"), keys.PublicKeys())
+// errors.Is(err, decision.ErrChain) if anything was altered
+```
+
+An actor with no signing key can't record a decision at all. Verification catches edited content, deleted or reordered records, re-attribution to another actor, and signatures forged with the wrong key, and `NewChainLog` refuses to extend a broken chain.
+
 ## Run the in-memory demo
 
 ```sh
@@ -247,19 +357,22 @@ The demo walks an agent through onboarding customers against a fake world:
 - **Reconcile is only as good as the downstream system.** It works when the world can be queried by idempotency key. Systems that can't (fire-and-forget email, some legacy APIs) leave steps uncertain.
 - **Three logs, not one.** The effect store (source of truth for recovery), the effect ledger (audit trail) and the decision log are separate files. They're linked by intent ID, but not written atomically together.
 - **Compensation is trusted.** An `Undo` that lies or partially succeeds isn't detected. Verifying that compensation actually restored the prior state is an open problem.
-- **Replay sees plans, not consequences.** The counterfactual runtime compares what programs *would do*, not what the world would do in response (customer reactions, downstream systems). That needs simulators per effect type.
+- **Simulators are only as good as their models.** Predictions are summed per effect; there's no interaction between effects or customers, and no uncertainty estimate.
+- **Evaluation is naive statistics.** `Evaluate` compares means after `MinSamples`, with no significance test or sequential correction. Fine for a prototype, risky for real money.
 - **Programs must be pure.** Replay assumes a `Program` only describes effects. One that performs I/O while deciding will do it during replay too.
+- **The intent compiler compiles to checks, not programs.** It turns a spec into what candidates must satisfy; generating candidate programs from the spec (e.g. with a model) is left to the caller.
+- **Keys are in memory.** The keyring has no persistence, rotation or revocation.
 - **Single machine.** File locking is advisory and Unix-only; there's no distributed coordination across services.
 
 ## Where this is going
 
-The three foundations are in place. The ideas they were built to support, not yet started:
+Both layers are in place: effects, decisions and replay underneath; intent, simulation, evolution and accountability on top. What's left is closing the loop:
 
-- **Intent compiler.** Goals and invariants as a formal input; programs generated from them; ambiguity sent back to a human as questions.
-- **Evolutionary runtime.** Several candidate programs live at once, each gated by replay, with outcomes from the decision ledger deciding which survives.
-- **Outcome-aware rewind.** Use observed outcomes to *suggest* which decision to rewind, rather than waiting for a person to notice.
-- **World simulators.** Per-effect models so replay can predict consequences, not only plans.
-- **Accountability chain.** Signed attestations from every effect back to the human who set the goal.
+- **Program synthesis from intent.** Have a model propose candidate programs directly from a compiled spec, then let the gate and evolution do the rest.
+- **Simulator calibration.** Compare predictions with observed outcomes per variant and correct the models automatically (the `$65` case in `cmd/evolution` is exactly the gap to close).
+- **Sound evaluation.** Sequential testing so promotions and retirements carry real confidence.
+- **Contract negotiation.** Agents agreeing interfaces at runtime, checked by the same replay gate.
+- **Distributed effects.** Coordinated escrow and rewind across services, not just within one process.
 
 ## License
 

@@ -26,6 +26,10 @@ jobs:
           grep -q "verdict: BLOCKED" story.txt
           grep -q "verdict: SAFE TO PROMOTE" story.txt
           grep -q "world unchanged by either replay" story.txt
+          go run ./cmd/evolution | tee evo.txt
+          grep -q "promoted \$52 over \$55" evo.txt
+          grep -q "customers on \$65 after auto-rewind: 0" evo.txt
+          grep -q "chain verifies" evo.txt
       - name: crash-recovery smoke test
         run: |
           go build -o agentctl ./cmd/agentctl

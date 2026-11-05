@@ -64,10 +64,18 @@ func (l *MemoryLog) Append(r Record) error {
 	return nil
 }
 
+// Load returns copies, so callers can't alter stored history.
 func (l *MemoryLog) Load() ([]Record, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return append([]Record(nil), l.records...), nil
+	out := append([]Record(nil), l.records...)
+	for i := range out {
+		if out[i].Node != nil {
+			n := *out[i].Node
+			out[i].Node = &n
+		}
+	}
+	return out, nil
 }
 
 // FileLog appends records as JSON lines, fsyncing each one.
