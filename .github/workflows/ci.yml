@@ -27,5 +27,6 @@ jobs:
           ./agentctl -dir "$RUNNER_TEMP/st" onboard acme
           ./agentctl -dir "$RUNNER_TEMP/st" crash initech || test $? -eq 137
           ./agentctl -dir "$RUNNER_TEMP/st" status | tee out.txt
-          grep -q "recovered onboard-initech" out.txt
+          grep -q "recovered onboard-initech from a crash: rolled_back" out.txt
+          ./agentctl -dir "$RUNNER_TEMP/st" world | grep -q "workspaces=\[ws-acme\]"
           grep -q "onboard-acme *pending" out.txt

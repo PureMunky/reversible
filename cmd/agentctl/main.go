@@ -7,7 +7,7 @@
 //	agentctl undo onboard-acme     # as if it never happened
 //	agentctl release onboard-acme  # apply held effects now
 //	agentctl tick                  # apply escrow whose hold window passed
-//	agentctl crash initech         # die mid-intent; next run recovers it
+//	agentctl crash initech         # die mid-intent; next run reconciles and recovers it
 //	agentctl world                 # show the fake world
 //	agentctl log onboard-acme      # ledger for one intent
 package main
@@ -30,9 +30,10 @@ import (
 // world is a stand-in for real systems (a database, a payment provider, an
 // email service). It lives in a file so it outlives each process.
 type world struct {
-	Accounts map[string]bool `json:"accounts"`
-	Charges  map[string]int  `json:"charges"`
-	Outbox   []string        `json:"outbox"`
+	Accounts   map[string]bool   `json:"accounts"`
+	Workspaces map[string]string `json:"workspaces"` // idempotency key -> workspace
+	Charges    map[string]int    `json:"charges"`
+	Outbox     []string          `json:"outbox"`
 }
 
 type worldFile string
@@ -50,7 +51,7 @@ func (f worldFile) update(fn func(*world) error) error {
 }
 
 func (f worldFile) load() (*world, error) {
-	w := &world{Accounts: map[string]bool{}, Charges: map[string]int{}}
+	w := &world{Accounts: map[string]bool{}, Workspaces: map[string]string{}, Charges: map[string]int{}}
 	b, err := os.ReadFile(string(f))
 	if errors.Is(err, os.ErrNotExist) {
 		return w, nil
@@ -58,7 +59,13 @@ func (f worldFile) load() (*world, error) {
 	if err != nil {
 		return nil, err
 	}
-	return w, json.Unmarshal(b, w)
+	if err := json.Unmarshal(b, w); err != nil {
+		return nil, err
+	}
+	if w.Workspaces == nil {
+		w.Workspaces = map[string]string{}
+	}
+	return w, nil
 }
 
 func (w *world) String() string {
@@ -71,7 +78,12 @@ func (w *world) String() string {
 	for _, c := range w.Charges {
 		total += c
 	}
-	return fmt.Sprintf("accounts=%v  charged=$%d  emails_sent=%v", accts, total, w.Outbox)
+	var wss []string
+	for _, ws := range w.Workspaces {
+		wss = append(wss, ws)
+	}
+	sort.Strings(wss)
+	return fmt.Sprintf("accounts=%v  workspaces=%v  charged=$%d  emails_sent=%v", accts, wss, total, w.Outbox)
 }
 
 func registry(wf worldFile, crash bool) *reversible.Registry {
@@ -92,14 +104,33 @@ func registry(wf worldFile, crash bool) *reversible.Registry {
 	reg.MustRegister("workspace.provision", reversible.Handler{
 		Class:    reversible.Reversible,
 		Describe: func(p reversible.Params) string { return "provision workspace for " + p["name"] },
-		Do: func(context.Context, reversible.Params) (reversible.Receipt, error) {
+		// The workspace is keyed by idempotency key, the way a real provider
+		// would dedupe requests. That is what makes Reconcile possible.
+		Do: func(ctx context.Context, p reversible.Params) (reversible.Receipt, error) {
+			key, ws := reversible.IdempotencyKey(ctx), "ws-"+p["name"]
+			if err := wf.update(func(w *world) error { w.Workspaces[key] = ws; return nil }); err != nil {
+				return nil, err
+			}
 			if crash {
-				fmt.Println("💥 process killed while provisioning (simulated)")
+				fmt.Println("💥 process killed after the workspace was created, before it was recorded (simulated)")
 				os.Exit(137)
 			}
-			return reversible.Receipt{"workspace": "ws"}, nil
+			return reversible.Receipt{"workspace": ws}, nil
 		},
-		Undo: func(context.Context, reversible.Params, reversible.Receipt) error { return nil },
+		Undo: func(ctx context.Context, _ reversible.Params, _ reversible.Receipt) error {
+			return wf.update(func(w *world) error { delete(w.Workspaces, reversible.IdempotencyKey(ctx)); return nil })
+		},
+		Reconcile: func(ctx context.Context, _ reversible.Params) (bool, reversible.Receipt, error) {
+			w, err := wf.load()
+			if err != nil {
+				return false, nil, err
+			}
+			ws, ok := w.Workspaces[reversible.IdempotencyKey(ctx)]
+			if !ok {
+				return false, nil, nil
+			}
+			return true, reversible.Receipt{"workspace": ws}, nil
+		},
 	})
 	reg.MustRegister("card.charge", reversible.Handler{
 		Class:    reversible.Escrowed,
@@ -138,6 +169,7 @@ commands:
   undo ID [REASON]        undo an intent
   release ID              apply an intent's held effects now
   tick                    apply held effects whose hold window has passed
+  reconcile ID            re-check uncertain steps against the world
   world                   show the fake world
   log ID                  show the ledger for an intent`)
 	os.Exit(2)
@@ -243,6 +275,17 @@ func run(dir string, hold time.Duration, args []string) error {
 			printResult(res)
 		}
 		return err
+	case "reconcile":
+		if len(args) < 2 {
+			usage()
+		}
+		res, err := rt.Reconcile(ctx, args[1])
+		if res != nil {
+			printResult(res)
+		}
+		if err != nil {
+			return err
+		}
 	case "world":
 		// handled below
 	case "log":

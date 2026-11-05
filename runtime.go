@@ -360,9 +360,12 @@ func (r *Runtime) Recover(ctx context.Context) ([]*Result, error) {
 				if s.state == StepInFlight {
 					s.state = StepUncertain
 					r.log(Event{IntentID: st.intent.ID, Effect: s.effect.Name, Class: s.effect.Class.String(), Kind: EventUncertain,
-						Detail: "interrupted mid-execution; outcome unknown, check the world"})
+						Detail: "interrupted mid-execution; outcome unknown"})
 				}
 			}
+			// Ask the world first, so a step that did happen is compensated
+			// in the right (reverse) order with everything else.
+			errs = append(errs, r.resolveUncertain(ctx, st)...)
 			r.rollback(ctx, st, "recovered after crash mid-execution")
 		}
 		res := r.report(st)
@@ -373,7 +376,74 @@ func (r *Runtime) Recover(ctx context.Context) ([]*Result, error) {
 	return results, errors.Join(errs...)
 }
 
+type idempotencyKey struct{}
+
+// IdempotencyKey returns the stable key for the effect currently running:
+// "<intent ID>/<effect name>". It is the same in Do, Undo and Reconcile and
+// across restarts, so pass it to downstream APIs (payment providers, queues)
+// to dedupe retries and to look the effect up when reconciling.
+func IdempotencyKey(ctx context.Context) string {
+	k, _ := ctx.Value(idempotencyKey{}).(string)
+	return k
+}
+
+func stepCtx(ctx context.Context, st *intentState, s *step) context.Context {
+	return context.WithValue(ctx, idempotencyKey{}, st.intent.ID+"/"+s.effect.Name)
+}
+
+// Reconcile asks the world about every uncertain step of an intent, using
+// each effect's Reconcile hook. Steps that turn out never to have happened
+// are cancelled; steps that did happen are compensated. Recover does this
+// automatically; call Reconcile to retry when the world was unreachable
+// during recovery.
+func (r *Runtime) Reconcile(ctx context.Context, intentID string) (*Result, error) {
+	st, err := r.get(intentID)
+	if err != nil {
+		return nil, err
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	errs := r.resolveUncertain(ctx, st)
+	if st.status == StatusPartial || st.status == StatusRolledBack {
+		r.rollback(ctx, st, st.reason)
+	}
+	return r.report(st), errors.Join(errs...)
+}
+
 // --- internals ---
+
+// resolveUncertain asks the world about each uncertain step. A step that
+// happened becomes done (with the receipt Reconcile found), so a following
+// rollback compensates it; one that didn't becomes cancelled.
+func (r *Runtime) resolveUncertain(ctx context.Context, st *intentState) []error {
+	var errs []error
+	for _, s := range st.steps {
+		if s.state != StepUncertain {
+			continue
+		}
+		e := s.effect
+		if e.Reconcile == nil {
+			continue
+		}
+		happened, rec, err := e.Reconcile(stepCtx(ctx, st, s))
+		if err != nil {
+			errs = append(errs, fmt.Errorf("intent %q: reconciling %q: %w", st.intent.ID, e.Name, err))
+			r.log(Event{IntentID: st.intent.ID, Effect: e.Name, Class: e.Class.String(), Kind: EventReconcileFailed, Detail: err.Error()})
+			continue
+		}
+		if happened {
+			s.state, s.receipt = StepDone, rec
+			r.log(Event{IntentID: st.intent.ID, Effect: e.Name, Class: e.Class.String(), Kind: EventReconciled, Receipt: rec,
+				Detail: "world says it happened"})
+		} else {
+			s.state = StepCancelled
+			r.log(Event{IntentID: st.intent.ID, Effect: e.Name, Class: e.Class.String(), Kind: EventReconciled,
+				Detail: "world says it never happened"})
+		}
+		_ = r.persist(st)
+	}
+	return errs
+}
 
 // apply runs one effect with write-ahead persistence: the step is saved as
 // in-flight before Do is called, so a crash during Do is detectable.
@@ -386,7 +456,7 @@ func (r *Runtime) apply(ctx context.Context, st *intentState, s *step, okKind Ev
 		r.rollback(ctx, st, fmt.Sprintf("could not persist before %s: %v", e.Name, err))
 		return fmt.Errorf("intent %q: persisting before %q: %w", st.intent.ID, e.Name, err)
 	}
-	rec, err := e.Do(ctx)
+	rec, err := e.Do(stepCtx(ctx, st, s))
 	if err != nil {
 		s.state = StepFailed
 		r.log(Event{IntentID: st.intent.ID, Effect: e.Name, Class: e.Class.String(), Kind: EventFailed, Detail: err.Error()})
@@ -421,27 +491,22 @@ func (r *Runtime) release(ctx context.Context, st *intentState, onlyDue bool) er
 // compensating applied effects.
 func (r *Runtime) rollback(ctx context.Context, st *intentState, reason string) {
 	id := st.intent.ID
-	partial := false
 	for i := len(st.steps) - 1; i >= 0; i-- {
 		s := st.steps[i]
 		e := s.effect
 		switch s.state {
-		case StepUncertain:
-			partial = true
 		case StepHeld:
 			s.state = StepCancelled
 			r.log(Event{IntentID: id, Effect: e.Name, Class: e.Class.String(), Kind: EventCancelled, Detail: reason})
 		case StepDone:
 			if e.Undo == nil {
 				s.state = StepStranded
-				partial = true
 				r.log(Event{IntentID: id, Effect: e.Name, Class: e.Class.String(), Kind: EventStranded,
 					Detail: "no compensation available; " + reason})
 				continue
 			}
-			if err := e.Undo(ctx, s.receipt); err != nil {
+			if err := e.Undo(stepCtx(ctx, st, s), s.receipt); err != nil {
 				s.state = StepStranded
-				partial = true
 				r.log(Event{IntentID: id, Effect: e.Name, Class: e.Class.String(), Kind: EventCompensationFailed, Detail: err.Error()})
 				continue
 			}
@@ -452,6 +517,12 @@ func (r *Runtime) rollback(ctx context.Context, st *intentState, reason string) 
 		_ = r.persist(st)
 	}
 	st.reason = reason
+	partial := false
+	for _, s := range st.steps {
+		if s.state == StepStranded || s.state == StepUncertain {
+			partial = true
+		}
+	}
 	if partial {
 		st.status = StatusPartial
 	} else {

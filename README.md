@@ -79,11 +79,16 @@ reg := reversible.NewRegistry()
 reg.MustRegister("card.charge", reversible.Handler{
     Class: reversible.Escrowed,
     Do: func(ctx context.Context, p reversible.Params) (reversible.Receipt, error) {
-        id, err := payments.Charge(ctx, p["customer"], p["amount"])
+        id, err := payments.Charge(ctx, p["customer"], p["amount"], reversible.IdempotencyKey(ctx))
         return reversible.Receipt{"charge": id}, err
     },
     Undo: func(ctx context.Context, p reversible.Params, r reversible.Receipt) error {
         return payments.Refund(ctx, r["charge"])
+    },
+    // Did a charge with this idempotency key go through before we crashed?
+    Reconcile: func(ctx context.Context, p reversible.Params) (bool, reversible.Receipt, error) {
+        id, found, err := payments.FindByKey(ctx, reversible.IdempotencyKey(ctx))
+        return found, reversible.Receipt{"charge": id}, err
     },
 })
 
@@ -100,7 +105,9 @@ With a store attached:
 
 - **Write-ahead.** Each step is saved as `in_flight` *before* its `Do` runs. If that save fails, the effect doesn't run and the intent rolls back.
 - **Escrow survives restarts.** Held effects, receipts and release times are on disk. A new process recovers them and can release or undo them.
-- **A crash counts as a failure.** If a process dies mid-intent, the next `Recover` rolls back everything that finished. The step that was mid-flight is marked **uncertain**: it may or may not have happened, so it's flagged for a human or a reconciler instead of being guessed at. Escrow after the crash point never runs.
+- **A crash counts as a failure.** If a process dies mid-intent, the next `Recover` rolls back everything that finished. Escrow after the crash point never runs.
+- **The world settles uncertainty, not a guess.** The step that was mid-flight is marked **uncertain**. If its type has a `Reconcile` hook, recovery asks the world whether it happened: if it did, it's compensated in order with everything else; if not, it's cancelled. Without a hook (or if the world is unreachable), it stays uncertain and is flagged, and `rt.Reconcile(ctx, id)` retries later.
+- **Stable idempotency keys.** Every `Do`, `Undo` and `Reconcile` call can read `reversible.IdempotencyKey(ctx)` (`<intent>/<effect>`), which is identical across retries and restarts. Pass it to downstream APIs to dedupe requests, and use it in `Reconcile` to look the effect up.
 - **No double compensation.** State is saved after each compensation, and recovering an already-recovered intent is a no-op.
 - **Durable means durable.** A runtime with a store rejects closure-only effects (`ErrNotDurable`) instead of quietly losing them on restart.
 
@@ -116,8 +123,8 @@ go run ./cmd/agentctl status
 go run ./cmd/agentctl undo onboard-acme wrong plan
 go run ./cmd/agentctl onboard globex 99
 go run ./cmd/agentctl release onboard-globex   # or wait out the hold and run: tick
-go run ./cmd/agentctl crash initech            # process dies mid-intent (exit 137)
-go run ./cmd/agentctl world                    # next process recovers and rolls it back
+go run ./cmd/agentctl crash initech            # dies after creating a workspace it never recorded (exit 137)
+go run ./cmd/agentctl world                    # next process reconciles, finds the orphan, rolls it all back
 go run ./cmd/agentctl log onboard-initech      # the ledger tells the story
 ```
 
@@ -150,7 +157,7 @@ The demo walks an agent through onboarding customers against a fake world:
 
 ## Limitations (it's a prototype)
 
-- **Uncertain steps need reconciling by hand.** The runtime flags them but can't yet ask the world what actually happened. A `Reconcile` hook per effect type is the natural next step.
+- **Reconcile is only as good as the downstream system.** It works when the world can be queried by idempotency key. Systems that can't (fire-and-forget email, some legacy APIs) leave steps uncertain.
 - **The ledger is an audit trail, not the source of truth.** Recovery depends on the store; the ledger is best-effort. Unifying them is part of the decision-ledger work.
 - **One process at a time per store.** There's no locking or leasing, so two processes sharing a state directory can conflict.
 - **Compensation is trusted.** An `Undo` that lies or partially succeeds isn't detected. Verifying that compensation actually restored the prior state is an open problem.

@@ -20,6 +20,9 @@ type Handler struct {
 	Describe func(p Params) string
 	Do       func(ctx context.Context, p Params) (Receipt, error)
 	Undo     func(ctx context.Context, p Params, r Receipt) error
+	// Reconcile optionally reports whether the effect happened, for steps
+	// a crash left uncertain. See Effect.Reconcile.
+	Reconcile func(ctx context.Context, p Params) (happened bool, r Receipt, err error)
 }
 
 // Registry maps effect type names to handlers.
@@ -95,6 +98,9 @@ func (r *Registry) build(name, description string, spec Spec) (Effect, error) {
 	}
 	if h.Undo != nil {
 		e.Undo = func(ctx context.Context, rc Receipt) error { return h.Undo(ctx, p, rc) }
+	}
+	if h.Reconcile != nil {
+		e.Reconcile = func(ctx context.Context) (bool, Receipt, error) { return h.Reconcile(ctx, p) }
 	}
 	return e, nil
 }

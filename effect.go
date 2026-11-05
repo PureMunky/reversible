@@ -88,6 +88,12 @@ type Effect struct {
 	Do          func(ctx context.Context) (Receipt, error)
 	Undo        func(ctx context.Context, r Receipt) error
 
+	// Reconcile, if set, asks the world whether this effect actually
+	// happened. It is used when a crash interrupted Do and the outcome is
+	// unknown. Look the effect up by IdempotencyKey(ctx), the same key Do
+	// saw. Return the receipt Undo will need if it did happen.
+	Reconcile func(ctx context.Context) (happened bool, r Receipt, err error)
+
 	// Spec is set when the effect was built from a Registry. A runtime with
 	// a durable Store only accepts effects that have one.
 	Spec *Spec
