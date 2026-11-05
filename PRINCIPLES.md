@@ -30,18 +30,22 @@ If a change can't answer these, it is plumbing for some other idea.
 
 ## Where the repo stands against the root idea
 
-The foundations exist. The pieces govern *how changes reach the world safely*:
-
 | Principle | Built | Package |
 |---|---|---|
-| Intent is the source of truth | Specs compiled to checks; ambiguity comes back as questions | `intent` |
-| History is decisions, not diffs | Causal, signed, hash-chained decision ledger with rewind | `decision` |
-| Reversibility replaces permission | Declared, escrowed, compensable effects; crash recovery | `reversible` |
-| Behaviour is reviewed, not code | Replay of recorded traffic; behaviour diffs; invariants; simulators | `counterfactual` |
+| Intent is the source of truth | Conversations become a service spec; vague or contradictory intent comes back as questions and isn't built | `factory`, `intent` |
+| Code is a cache | A real service is generated from the spec, built and run as its own process, marked do-not-edit, keyed by the intent's hash and only regenerated when intent changes; a model coder repairs its own failures | `factory` |
+| History is decisions, not diffs | Every release traces to the conversation that caused it, in a signed, hash-chained ledger; rewinding a decision takes the running software back | `decision`, `factory` |
+| Reversibility replaces permission | Releases, and every other effect, are declared and undoable; crash recovery | `reversible`, `factory` |
+| Behaviour is reviewed, not code | Recorded traffic replayed through both versions; every difference traced to the intent change that explains it (including knock-on effects); existing production data read through both versions; unexplained differences block sign-off | `factory`, `counterfactual` |
 | Releases become evolution | Gated challengers, significance testing, automatic rewind | `evolve` |
-| Production is an input | Outcomes calibrate the models and drive the next proposals | `counterfactual`, `synth` |
-| Code is generated from intent | A model proposes *policies* (data) from the spec and evidence | `synth`, `policy`, `model` |
+| Production is an input | Recorded traffic and live data judge every change; outcomes calibrate models and drive the next proposals | `factory`, `counterfactual`, `synth` |
 
-**The gap:** so far the thing being generated and evolved is a *policy* (a small rules language), and every demo exercises it on pricing. The root idea needs the artifact to be **the software itself**: a conversation produces intent, a model generates a real service, the system builds and tests it, shows the behaviour diff, gets product sign-off, releases it by evolution, and regenerates it when intent changes, with no human editing code.
+**First slice closed:** `go run ./cmd/factory` builds, changes, releases and rewinds a real service from conversation, with no person writing or editing code. Run it with `-faulty-coder` to watch a build that passes every example get stopped because it would silently change existing production data.
 
-That is the next milestone. Everything built so far is the plumbing underneath it.
+**What's still open:**
+
+- **The spec language is small.** One resource, field validation, one kind of rule. Real services need several resources, relations, queries, auth and integrations.
+- **The offline coder is a compiler, not a model.** Without `ANTHROPIC_API_KEY`, the spec is written alongside each conversation and code comes from a deterministic generator. The Claude path (capture and coding, with a repair loop) is tested against scripted replies, not yet against a live model.
+- **Releases are all at once.** The factory's versions aren't yet released through `evolve`'s gated challengers and live statistics.
+- **Production doesn't yet write intent.** Incidents and outcomes are inputs to judging changes, not yet turned into proposed intent changes or questions.
+- **Replay assumes a known starting state.** Recorded traffic is replayed from empty; snapshots would remove that limit.

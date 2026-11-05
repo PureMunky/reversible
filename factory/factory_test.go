@@ -258,3 +258,32 @@ func TestUnexplainedChangesAreFlagged(t *testing.T) {
 		t.Fatalf("diff:\n%s", d)
 	}
 }
+
+func TestDownstreamChangesAreTracedToTheirCause(t *testing.T) {
+	ctx := context.Background()
+	v1, v2 := build(t, spec(t, "flags-v1.json")), build(t, spec(t, "flags-v2.json"))
+	traffic := []Exchange{
+		{Request: HTTPCall{Method: "POST", Path: "/flags", Body: map[string]any{"key": "a", "owner": "x"}}},
+		{Request: HTTPCall{Method: "PATCH", Path: "/flags/a", Body: map[string]any{"enabled": true}}},
+		{Request: HTTPCall{Method: "DELETE", Path: "/flags/a"}}, // refused under v2
+		{Request: HTTPCall{Method: "GET", Path: "/flags/a"}},    // 404 vs 200: follows from the refusal
+		{Request: HTTPCall{Method: "GET", Path: "/flags"}},      // [] vs [a]: follows from the refusal
+		{Request: HTTPCall{Method: "POST", Path: "/flags", Body: map[string]any{"key": "b", "owner": "y"}}},
+	}
+	d, err := Diff(ctx, traffic, v1, v2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(d.Unexpected()) != 0 {
+		t.Fatalf("diff:\n%s", d)
+	}
+	n := 0
+	for _, c := range d.Changes {
+		if strings.HasPrefix(c.Because, "follows from earlier change (new rule") {
+			n++
+		}
+	}
+	if n != 2 {
+		t.Fatalf("expected 2 downstream changes traced to the new rule:\n%s", d)
+	}
+}

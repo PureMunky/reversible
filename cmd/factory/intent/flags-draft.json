@@ -1,0 +1,83 @@
+{
+  "service": "flags",
+  "purpose": "Feature flags for the platform team: who owns each flag and whether it is on, so releases can be decoupled from deploys.",
+  "resource": {
+    "name": "flag",
+    "plural": "flags",
+    "key": "key",
+    "fields": [
+      {
+        "name": "key",
+        "type": "string",
+        "required": false,
+        "pattern": "^[a-z][a-z0-9-*$",
+        "why": "keys appear in code and URLs"
+      },
+      {
+        "name": "owner",
+        "type": "string",
+        "required": true
+      },
+      {
+        "name": "enabled",
+        "type": "bool",
+        "default": false
+      },
+      {
+        "name": "description",
+        "type": "string"
+      }
+    ]
+  },
+  "examples": [
+    {
+      "name": "create a flag",
+      "request": {
+        "method": "POST",
+        "path": "/flags",
+        "body": {
+          "key": "new-checkout",
+          "owner": "payments"
+        }
+      },
+      "expect": {
+        "status": 201,
+        "body": {
+          "key": "new-checkout",
+          "owner": "payments",
+          "enabled": false
+        }
+      }
+    },
+    {
+      "name": "flags start off",
+      "request": {
+        "method": "GET",
+        "path": "/flags/new-checkout"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "enabled": false
+        }
+      }
+    },
+    {
+      "name": "turn it on",
+      "request": {
+        "method": "PATCH",
+        "path": "/flags/new-checkout",
+        "body": {
+          "enabled": true
+        }
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "key": "new-checkout",
+          "enabled": true
+        }
+      }
+    }
+  ]
+}

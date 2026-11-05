@@ -41,6 +41,17 @@ jobs:
           grep -q "PROMOTE tiered" designer.txt
           grep -q "converged" designer.txt
           grep -q "chain verifies" designer.txt
+          go run ./cmd/factory | tee factory.txt
+          grep -q "9/9 examples pass" factory.txt
+          grep -q "12/12 examples pass" factory.txt
+          grep -q "Phil signs off on that reality" factory.txt
+          ! grep -q "UNEXPLAINED" factory.txt
+          grep -q "cached: intent unchanged" factory.txt
+          grep -q "written or edited by a person: 0" factory.txt
+          grep -q "chain verifies" factory.txt
+          go run ./cmd/factory -faulty-coder | tee faulty.txt
+          grep -q "UNEXPLAINED" faulty.txt
+          grep -q "Phil does NOT sign off" faulty.txt
       - name: crash-recovery smoke test
         run: |
           go build -o agentctl ./cmd/agentctl

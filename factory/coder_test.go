@@ -73,3 +73,30 @@ func TestExtractGo(t *testing.T) {
 		t.Error("expected error")
 	}
 }
+
+func TestCaptureDraftsSpecFromConversation(t *testing.T) {
+	v1 := spec(t, "flags-v1.json")
+	reply := "Sure.\n```json\n{\"spec\": " + v1.JSON() + ", \"questions\": [\"Should keys allow underscores?\"]}\n```"
+	m := &scripted{replies: []string{reply}}
+	conv := []Turn{{Who: "phil", Says: "We need a feature flag service. Every flag needs an owner."}}
+	got, err := Capture(context.Background(), m, conv, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Spec.Hash() != v1.Hash() || len(got.Questions) != 1 {
+		t.Fatalf("captured: %+v", got)
+	}
+	for _, want := range []string{"EXAMPLE OF THE FORMAT", "SERVICE CONTRACT", "phil: We need a feature flag service."} {
+		if !strings.Contains(m.prompts[0], want) {
+			t.Errorf("prompt missing %q", want)
+		}
+	}
+	// Updating: the current spec goes in, so unchanged intent is kept.
+	m2 := &scripted{replies: []string{`{"spec": {"service": "flags", "bogus": 1}}`}}
+	if _, err := Capture(context.Background(), m2, conv, &v1); err == nil || !strings.Contains(err.Error(), "bogus") {
+		t.Fatalf("unknown fields from a model must be rejected: %v", err)
+	}
+	if !strings.Contains(m2.prompts[0], "CURRENT SPECIFICATION") {
+		t.Error("update prompt lacks the current spec")
+	}
+}

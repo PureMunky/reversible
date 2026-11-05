@@ -78,6 +78,7 @@ func Diff(ctx context.Context, traffic []Exchange, live, candidate *Version) (Be
 		}
 		c := Change{Index: i, Request: t.Request, Old: oldR, New: newR}
 		c.Because = ex.explain(c)
+		ex.track(c)
 		d.Changes = append(d.Changes, c)
 	}
 	return d, nil
@@ -151,6 +152,10 @@ func DiffState(ctx context.Context, snapshot string, live, candidate *Version) (
 }
 
 type explainer struct {
+	// diverged records which records the two versions now hold
+	// differently, and the explained change that caused it. Later
+	// differences confined to those records follow from that cause.
+	diverged  map[string]string
 	newFields map[string]bool
 	oldSpec   ServiceSpec
 	newSpec   ServiceSpec
@@ -159,7 +164,7 @@ type explainer struct {
 }
 
 func newExplainer(oldS, newS ServiceSpec) *explainer {
-	e := &explainer{newFields: map[string]bool{}, changed: map[string]bool{}, oldSpec: oldS, newSpec: newS}
+	e := &explainer{newFields: map[string]bool{}, changed: map[string]bool{}, diverged: map[string]string{}, oldSpec: oldS, newSpec: newS}
 	old := map[string]Field{}
 	for _, f := range oldS.Resource.Fields {
 		old[f.Name] = f
@@ -233,9 +238,124 @@ func (e *explainer) explain(c Change) string {
 			}
 		}
 	}
-	// Anything downstream of a request the new intent treats differently
-	// is reported as unexpected: the reviewer should look.
+	// Differences confined to records an earlier, explained change made
+	// diverge follow from that change.
+	if why := e.downstream(c); why != "" {
+		return why
+	}
 	return ""
+}
+
+// recordKey is the record a request is about, if any.
+func (e *explainer) recordKey(c HTTPCall) string {
+	base := "/" + e.newSpec.Resource.Plural + "/"
+	if strings.HasPrefix(c.Path, base) {
+		return strings.TrimPrefix(c.Path, base)
+	}
+	if m, ok := c.Body.(map[string]any); ok && c.Method == "POST" {
+		if k, ok := m[e.newSpec.Resource.Key].(string); ok {
+			return k
+		}
+	}
+	return ""
+}
+
+// track remembers records that now differ between versions because of an
+// explained change to a request that writes.
+func (e *explainer) track(c Change) {
+	if c.Because == "" || c.Request.Method == "GET" || c.Old.Status == c.New.Status {
+		return
+	}
+	if k := e.recordKey(c.Request); k != "" {
+		if _, seen := e.diverged[k]; !seen {
+			e.diverged[k] = c.Because
+		}
+	}
+}
+
+func (e *explainer) downstream(c Change) string {
+	if len(e.diverged) == 0 {
+		return ""
+	}
+	if k := e.recordKey(c.Request); k != "" {
+		if why, ok := e.diverged[k]; ok {
+			e.track(Change{Request: c.Request, Old: c.Old, New: c.New, Because: why})
+			return "follows from earlier change (" + why + ")"
+		}
+		return ""
+	}
+	// A list: every differing item must be a diverged record, or differ
+	// only by new fields at their defaults.
+	oldL, ok1 := c.Old.Body.([]any)
+	newL, ok2 := c.New.Body.([]any)
+	if c.Request.Method != "GET" || !ok1 || !ok2 {
+		return ""
+	}
+	key := e.newSpec.Resource.Key
+	index := func(l []any) map[string]any {
+		out := map[string]any{}
+		for _, it := range l {
+			if m, ok := it.(map[string]any); ok {
+				out[fmt.Sprint(m[key])] = it
+			}
+		}
+		return out
+	}
+	oi, ni := index(oldL), index(newL)
+	reasons := map[string]bool{}
+	for k := range union(oi, ni) {
+		o, inOld := oi[k]
+		n, inNew := ni[k]
+		if inOld && inNew {
+			if reflect.DeepEqual(o, n) {
+				continue
+			}
+			vals := map[string][]any{}
+			if added := onlyAdded(o, n, vals); added != nil && allIn(added, e.newFields) && e.atDefaults(vals) {
+				continue
+			}
+		}
+		why, ok := e.diverged[k]
+		if !ok {
+			return ""
+		}
+		reasons[why] = true
+	}
+	if len(reasons) == 0 {
+		return ""
+	}
+	var rs []string
+	for r := range reasons {
+		rs = append(rs, r)
+	}
+	sort.Strings(rs)
+	return "follows from earlier change (" + strings.Join(rs, "; ") + ")"
+}
+
+func (e *explainer) atDefaults(vals map[string][]any) bool {
+	for k, vs := range vals {
+		def, ok := e.defaultOf(k)
+		if !ok {
+			continue
+		}
+		for _, v := range vs {
+			if !reflect.DeepEqual(v, def) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func union(a, b map[string]any) map[string]bool {
+	out := map[string]bool{}
+	for k := range a {
+		out[k] = true
+	}
+	for k := range b {
+		out[k] = true
+	}
+	return out
 }
 
 func (e *explainer) defaultOf(field string) (any, bool) {
@@ -330,8 +450,16 @@ func (d BehaviourDiff) String() string {
 	for _, k := range order {
 		cs := groups[k]
 		c := cs[0]
-		fmt.Fprintf(&b, "  %-45s ×%d  e.g. %s %s: %d %s → %d %s\n", k, len(cs), c.Request.Method, c.Request.Path,
-			c.Old.Status, compact(c.Old.Body), c.New.Status, compact(c.New.Body))
+		fmt.Fprintf(&b, "  ×%-3d %s\n        e.g. %s %s: %d %s → %d %s\n", len(cs), k, c.Request.Method, c.Request.Path,
+			c.Old.Status, short(c.Old.Body), c.New.Status, short(c.New.Body))
 	}
 	return b.String()
+}
+
+func short(v any) string {
+	s := compact(v)
+	if len(s) > 90 {
+		s = s[:87] + "..."
+	}
+	return s
 }

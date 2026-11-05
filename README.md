@@ -6,12 +6,34 @@ In an agentic world, writing code is cheap. What's scarce is knowing exactly wha
 
 `reversible` is a working prototype of that idea's foundations, in Go with no dependencies. Every action an agent takes is *declared up front* and *undoable by construction*; every decision is *traceable and rewindable*; every proposed change is *replayed against real traffic* and evolved against the current version on evidence. Only the actions that truly can't be undone reach a person.
 
-**Where it stands:** the foundations govern how changes reach the world safely, and a model can already generate behaviour (as policies) from intent and evidence. The demos use pricing as an example domain; nothing in the mechanism assumes it. The next milestone is the root idea itself: a conversation produces intent, a model generates **a real service**, and the system builds, tests, diffs, releases and regenerates it with no human editing code.
+**Where it stands:** the first end-to-end slice of the root idea works. A conversation becomes intent, a real service is generated from it, built, verified, diffed by behaviour against production traffic and data, signed off, released and rewound, with no person writing or editing code (`cmd/factory`). Underneath are the foundations: reversible effects, a signed decision ledger, replay, simulation, evolution and synthesis. Other demos use pricing as an example domain; nothing in the mechanism assumes it. What's still open is listed in [PRINCIPLES.md](PRINCIPLES.md#where-the-repo-stands-against-the-root-idea).
+
+## The root idea, end to end
+
+```sh
+go run ./cmd/factory                        # offline: deterministic coder
+ANTHROPIC_API_KEY=sk-... go run ./cmd/factory  # Claude drafts the spec and writes the code
+go run ./cmd/factory -faulty-coder          # a coder with a migration bug, caught before release
+```
+
+A real service built, changed, released and rewound from conversation. Nobody writes or edits code.
+
+1. **Phil describes a feature-flag service** for his platform team. The first draft of the spec is checked before anything is built, and the factory asks instead of guessing: an invalid key pattern and an optional key are blocking; a missing owner and no examples of list or delete are clarifying questions.
+2. **The factory generates the service** (241 lines of Go), builds it, runs it as its own process, and checks it against the spec's examples: 9/9 pass. Phil signs off on that behaviour; the release is recorded as a decision and goes live.
+3. **The team uses it for a week.** Every request is recorded.
+4. **Phil changes the intent, not the code:** gradual rollouts, and no deleting a flag that's still on. A new service is generated (12/12 examples pass).
+5. **What would change, shown as behaviour.** The week's traffic is replayed through both versions: 17 requests would behave differently, and every one is traced to what Phil asked for (14 by the new field, 1 by the new rule, 2 as knock-on effects of that refused delete). Every existing flag is also read through both versions, to catch anything that misreads old data.
+6. **Phil signs off; v2 goes live** on the same production data.
+7. **A team's cleanup script breaks** on the new rule. Phil rewinds the *decision*; v1 is live again, with the data intact.
+8. **The intent is agreed again later.** Same intent, same software: the build comes from the cache, with nothing regenerated.
+
+With `-faulty-coder`, the v2 build still passes all 12 examples, but reading production data through it shows every existing flag that was on silently dropping to 0% rollout. That change isn't explained by anything Phil asked for, so it isn't released. Examples alone would have shipped it.
 
 ## Layers
 
 | Layer | Package | Answers | Key operation |
 |---|---|---|---|
+| **Factory** | `reversible/factory` | *Build the software itself from intent* | `Capture`, `Check`, `Build`, `Diff`, `DiffState`, `Router.Release` |
 | **Effect system** | `reversible` | *What happened, and can it be undone?* | `Execute`, `Undo`, `Release`, `Recover` |
 | **Decision ledger** | `reversible/decision` | *Why did it happen, and who decided?* | `Decide`, `Explain`, `Rewind`, `ChainLog` |
 | **Counterfactual runtime** | `reversible/counterfactual` | *What would this change do, and what would happen?* | `Replay`, `ReplayWith` + `Simulators` |
