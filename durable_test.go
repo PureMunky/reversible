@@ -106,6 +106,7 @@ func TestEscrowSurvivesRestart(t *testing.T) {
 	}
 
 	// Process dies. A new one starts with a fresh registry over the same world.
+	rt1.Close() // the previous process is gone; the OS would release its lock
 	rt2 := durableRuntime(t, dir, registryFor(w, ""), &now)
 	results, err := rt2.Recover(ctx)
 	if err != nil {
@@ -124,6 +125,7 @@ func TestEscrowSurvivesRestart(t *testing.T) {
 	}
 
 	// And a third process can still undo it, using the persisted receipts.
+	rt2.Close() // the previous process is gone; the OS would release its lock
 	rt3 := durableRuntime(t, dir, registryFor(w, ""), &now)
 	rt3.Recover(ctx)
 	res, err := rt3.Undo(ctx, "i1", "customer cancelled")
@@ -156,6 +158,7 @@ func TestCrashMidIntentRollsBackOnRecovery(t *testing.T) {
 		t.Fatal("setup: account should exist before recovery")
 	}
 
+	rt1.Close() // the previous process is gone; the OS would release its lock
 	rt2 := durableRuntime(t, dir, registryFor(w, ""), &now)
 	results, err := rt2.Recover(ctx)
 	if err != nil {
@@ -183,6 +186,7 @@ func TestCrashMidIntentRollsBackOnRecovery(t *testing.T) {
 	}
 
 	// Recovering again is a no-op: nothing is compensated twice.
+	rt2.Close() // the previous process is gone; the OS would release its lock
 	rt3 := durableRuntime(t, dir, registryFor(w, ""), &now)
 	results, _ = rt3.Recover(ctx)
 	if results[0].Status != StatusPartial || results[0].Recovered {
@@ -198,6 +202,7 @@ func TestRecoverFailsLoudlyOnUnknownType(t *testing.T) {
 	rt1 := durableRuntime(t, dir, registryFor(w, ""), &now)
 	rt1.Execute(ctx, onboard(registryFor(w, ""), "i1", "acme"))
 
+	rt1.Close()                                        // the previous process is gone; the OS would release its lock
 	rt2 := durableRuntime(t, dir, NewRegistry(), &now) // forgot to register types
 	if _, err := rt2.Recover(ctx); err == nil || !strings.Contains(err.Error(), "unknown effect type") {
 		t.Fatalf("err = %v", err)
@@ -238,4 +243,26 @@ func TestSnapshotIsReadable(t *testing.T) {
 			t.Errorf("snapshot missing %s:\n%s", want, b)
 		}
 	}
+}
+
+func TestStoreLockExcludesSecondProcess(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	w := newWorld()
+	now := time.Now()
+	rt1 := durableRuntime(t, dir, registryFor(w, ""), &now)
+	if _, err := rt1.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	rt2 := durableRuntime(t, dir, registryFor(w, ""), &now)
+	if _, err := rt2.Recover(ctx); !errors.Is(err, ErrLocked) {
+		t.Fatalf("second runtime: err = %v, want ErrLocked", err)
+	}
+	if err := rt1.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rt2.Recover(ctx); err != nil {
+		t.Fatalf("after Close: %v", err)
+	}
+	rt2.Close()
 }

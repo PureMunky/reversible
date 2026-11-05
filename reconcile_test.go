@@ -92,6 +92,7 @@ func (w *ledgerWorld) crashThenRecover(t *testing.T, crashMode string, withRecon
 		defer func() { _ = recover() }()
 		rt1.Execute(ctx, w.intent(crashing))
 	}()
+	rt1.Close() // the previous process is gone; the OS would release its lock
 	rt2 := durableRuntime(t, dir, w.registry("", withReconcile), &now)
 	results, err := rt2.Recover(ctx)
 	if len(results) != 1 {

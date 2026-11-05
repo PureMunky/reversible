@@ -204,6 +204,7 @@ func run(dir string, hold time.Duration, args []string) error {
 		reversible.WithLedger(reversible.NewFileLedger(filepath.Join(dir, "ledger.jsonl"))),
 		reversible.WithHold(hold),
 	)
+	defer rt.Close()
 
 	// Every process starts by recovering what the last one left behind.
 	recovered, err := rt.Recover(ctx)

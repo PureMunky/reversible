@@ -2,11 +2,37 @@
 
 **Agents don't need permission. They need undo.**
 
-`reversible` is a prototype effect system for agentic software, written in Go. Instead of gating every action behind a human, every action an agent takes is *declared up front* and *undoable by construction*. Only the actions that truly can't be undone get routed to a person, and the architecture's job is to keep that set as small as possible.
+`reversible` is a prototype runtime for agentic software, written in Go with no dependencies. Instead of gating every action behind a human, every action an agent takes is *declared up front* and *undoable by construction*, every decision is *traceable and rewindable*, and every proposed change is *replayed against real traffic* before it's allowed to act. Only the actions that truly can't be undone get routed to a person, and the architecture's job is to keep that set as small as possible.
 
-It is the first building block of a larger idea: software built for agents, where intent and consequences are the primary artifacts and code is something that gets regenerated in between.
+It explores a larger idea: software built for agents, where intent and consequences are the primary artifacts and code is something that gets regenerated in between.
 
-## The model
+## Three layers
+
+| Layer | Package | Answers | Key operation |
+|---|---|---|---|
+| **Effect system** | `reversible` | *What happened, and can it be undone?* | `Execute`, `Undo`, `Release`, `Recover` |
+| **Decision ledger** | `reversible/decision` | *Why did it happen?* | `Decide`, `Explain`, `Rewind` |
+| **Counterfactual runtime** | `reversible/counterfactual` | *What would this change have done?* | `Record`, `Replay` → verdict |
+
+```
+goal ─▶ decision ─▶ decision ─▶ intent ─▶ effects ─▶ world
+           │                        ▲
+           └──── rewind ────────────┘  (undo everything downstream, newest first)
+
+recorded traffic ─▶ baseline program  ─┐
+                 └▶ candidate program ─┴▶ diff + invariants ─▶ promote / block
+                    (every effect intercepted; nothing touches the world)
+```
+
+See all three working together on one story:
+
+```sh
+go run ./cmd/storyline
+```
+
+A pricing agent decides to move customers to annual plans and acts on it. Phil asks *why* one customer ended up on a credit plan and gets the full chain of reasoning. Phil rewinds the decision: five intents across two decisions are undone, newest first, and the one email that can't be unsent is flagged. The agent then proposes v2 pricing, which replay blocks (a new one-way door and a broken invariant); v3 passes.
+
+## The effect system
 
 Every action is an **Effect** with one of three classes:
 
@@ -109,6 +135,7 @@ With a store attached:
 - **The world settles uncertainty, not a guess.** The step that was mid-flight is marked **uncertain**. If its type has a `Reconcile` hook, recovery asks the world whether it happened: if it did, it's compensated in order with everything else; if not, it's cancelled. Without a hook (or if the world is unreachable), it stays uncertain and is flagged, and `rt.Reconcile(ctx, id)` retries later.
 - **Stable idempotency keys.** Every `Do`, `Undo` and `Reconcile` call can read `reversible.IdempotencyKey(ctx)` (`<intent>/<effect>`), which is identical across retries and restarts. Pass it to downstream APIs to dedupe requests, and use it in `Reconcile` to look the effect up.
 - **No double compensation.** State is saved after each compensation, and recovering an already-recovered intent is a no-op.
+- **One owner at a time.** A `FileStore` is locked exclusively by the first runtime to `Execute` or `Recover`; a second process gets `ErrLocked`. `Close` (or process exit) releases it.
 - **Durable means durable.** A runtime with a store rejects closure-only effects (`ErrNotDurable`) instead of quietly losing them on restart.
 
 Handlers should be idempotent, since recovery and retries may call them for an effect whose outcome is unknown.
@@ -127,6 +154,66 @@ go run ./cmd/agentctl crash initech            # dies after creating a workspace
 go run ./cmd/agentctl world                    # next process reconciles, finds the orphan, rolls it all back
 go run ./cmd/agentctl log onboard-initech      # the ledger tells the story
 ```
+
+## The decision ledger
+
+The effect runtime records *what* happened. `decision` records *why*, as an append-only causal graph:
+
+```go
+g, _ := decision.Open(decision.NewFileLog("decisions.jsonl"))
+
+g.Goal("grow-revenue", "grow revenue 10% this quarter", "phil")
+g.Decide(decision.Decision{
+    ID: "annual-plans", Parents: []string{"grow-revenue"}, Actor: "pricing-agent",
+    Summary:      "move monthly customers to annual plans",
+    Rationale:    "annual billing pulls revenue forward",
+    Alternatives: []string{"raise monthly prices 8%", "upsell add-ons"},
+})
+g.Execute(ctx, rt, "annual-plans", intent)   // links the intent, then runs it
+g.Observe(decision.Outcome{ID: "week-1", Parents: []string{"annual-plans"},
+    Summary: "support tickets spiked", Metrics: map[string]float64{"tickets": 41}})
+
+why, _ := g.ExplainIntent("annual-acme")     // goal → decisions → rationale → alternatives
+rep, _ := g.Rewind(ctx, "annual-plans", rt, "support load too high", "phil")
+```
+
+- **Every decision traces to a goal.** Decisions must have parents; outcomes can't be causes; nothing can build on a rewound decision.
+- **Links before actions.** `Execute` records which decision an intent belongs to *before* running it, so nothing in the world is ever unexplained.
+- **Rewind a decision, not an action.** `Rewind` finds the decision and everything downstream of it (later decisions that built on it, their intents, outcomes attributed to them) and undoes the intents newest first through the effect runtime. The report lists what was undone, and anything stranded or uncertain.
+- **Nothing is deleted.** Rewound nodes are marked with who, when, why and as part of which rewind. The mistake stays in the story.
+- **Replayable.** The graph is rebuilt from its log on `Open`; every record is validated before it's written, so the log never holds something that can't be replayed.
+
+## The counterfactual runtime
+
+Agent behaviour is modelled as a `Program`: given a request, it returns the `Intent` it *would* execute. That makes behaviour testable without touching anything.
+
+```go
+traffic := counterfactual.NewFileRecorder("traffic.jsonl")
+live := counterfactual.Recording(v1, traffic)          // record real requests as they happen
+
+reqs, _ := traffic.Requests()
+rep := counterfactual.Replay(ctx, reqs, v1, v2,
+    []counterfactual.Invariant{maxCharge},              // rules every plan must satisfy
+    counterfactual.Policy{MaxChangedFraction: 0.25})    // blast-radius limit
+fmt.Print(rep)                                          // or rep.JSON() for CI / another agent
+if rep.Promote() { /* ship v2 */ }
+```
+
+For every recorded request, baseline and candidate both run with every effect intercepted (`Do` is never called), and the report shows exactly what would have changed:
+
+```
+replayed 4 requests: 2 unchanged, 2 changed
+  req-3 (active=false customer=initech tier=enterprise)
+    + purge-inactive [account.purge] {customer=initech}
+    ~ charge [card.charge] {amount=4500, ...}  →  charge [card.charge] {amount=6500, ...}
+    ⚠ new one-way door: purge-inactive
+    ✗ violates charge-at-most-5000: charges $6500
+verdict: BLOCKED
+  - candidate violates invariants on 1 request(s)
+  - candidate introduces irreversible effects on 2 request(s)
+```
+
+A candidate is blocked when it fails, panics, or produces an intent the runtime would reject on requests the baseline handles; when it *newly* violates an invariant (violations the baseline already had are shown but don't block); when it opens one-way doors the baseline never did (unless the policy allows it); or when it changes more traffic than the blast-radius limit.
 
 ## Run the in-memory demo
 
@@ -158,18 +245,21 @@ The demo walks an agent through onboarding customers against a fake world:
 ## Limitations (it's a prototype)
 
 - **Reconcile is only as good as the downstream system.** It works when the world can be queried by idempotency key. Systems that can't (fire-and-forget email, some legacy APIs) leave steps uncertain.
-- **The ledger is an audit trail, not the source of truth.** Recovery depends on the store; the ledger is best-effort. Unifying them is part of the decision-ledger work.
-- **One process at a time per store.** There's no locking or leasing, so two processes sharing a state directory can conflict.
+- **Three logs, not one.** The effect store (source of truth for recovery), the effect ledger (audit trail) and the decision log are separate files. They're linked by intent ID, but not written atomically together.
 - **Compensation is trusted.** An `Undo` that lies or partially succeeds isn't detected. Verifying that compensation actually restored the prior state is an open problem.
-- **Single process.** No distributed coordination across services yet.
+- **Replay sees plans, not consequences.** The counterfactual runtime compares what programs *would do*, not what the world would do in response (customer reactions, downstream systems). That needs simulators per effect type.
+- **Programs must be pure.** Replay assumes a `Program` only describes effects. One that performs I/O while deciding will do it during replay too.
+- **Single machine.** File locking is advisory and Unix-only; there's no distributed coordination across services.
 
 ## Where this is going
 
-This is step one of three foundations:
+The three foundations are in place. The ideas they were built to support, not yet started:
 
-1. **Effect system** (this repo): agents act freely because everything is declared, undoable, and survives a crash.
-2. **Decision ledger:** a causal graph of intent → decision → artifact → outcome, so you can rewind a *decision*, not just an action.
-3. **Counterfactual runtime:** run candidate changes against replayed production traffic with every effect intercepted, so testing becomes watching what *would* have happened.
+- **Intent compiler.** Goals and invariants as a formal input; programs generated from them; ambiguity sent back to a human as questions.
+- **Evolutionary runtime.** Several candidate programs live at once, each gated by replay, with outcomes from the decision ledger deciding which survives.
+- **Outcome-aware rewind.** Use observed outcomes to *suggest* which decision to rewind, rather than waiting for a person to notice.
+- **World simulators.** Per-effect models so replay can predict consequences, not only plans.
+- **Accountability chain.** Signed attestations from every effect back to the human who set the goal.
 
 ## License
 

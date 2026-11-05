@@ -42,9 +42,38 @@ type Store interface {
 	LoadAll() ([]IntentSnapshot, error)
 }
 
+// ErrLocked is returned when another process holds a store's lock.
+var ErrLocked = errors.New("store is locked by another process")
+
+// Locker is implemented by stores that can be held exclusively. A Runtime
+// with such a store takes the lock in Recover and releases it in Close, so
+// two processes can never act on the same intents at once.
+type Locker interface {
+	Lock() (unlock func() error, err error)
+}
+
 // FileStore keeps one JSON file per intent in a directory, written
 // atomically (temp file + rename).
 type FileStore struct{ dir string }
+
+// Lock takes an exclusive, non-blocking lock on the store directory.
+// It returns ErrLocked if another process holds it.
+func (s *FileStore) Lock() (func() error, error) {
+	f, err := os.OpenFile(filepath.Join(s.dir, "LOCK"), os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	if err := lockFile(f); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("%s: %w", s.dir, err)
+	}
+	f.Truncate(0)
+	fmt.Fprintf(f, "pid %d\n", os.Getpid())
+	return func() error {
+		err := unlockFile(f)
+		return errors.Join(err, f.Close())
+	}, nil
+}
 
 // NewFileStore creates the directory if needed.
 func NewFileStore(dir string) (*FileStore, error) {

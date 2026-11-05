@@ -116,6 +116,38 @@ type Runtime struct {
 	mu      sync.Mutex
 	intents map[string]*intentState
 	order   []string
+	unlock  func() error
+}
+
+// acquire takes the store lock once, if the store supports locking.
+func (r *Runtime) acquire() error {
+	l, ok := r.store.(Locker)
+	if !ok {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.unlock != nil {
+		return nil
+	}
+	unlock, err := l.Lock()
+	if err != nil {
+		return err
+	}
+	r.unlock = unlock
+	return nil
+}
+
+// Close releases the store lock taken by Recover or Execute, if any.
+func (r *Runtime) Close() error {
+	r.mu.Lock()
+	unlock := r.unlock
+	r.unlock = nil
+	r.mu.Unlock()
+	if unlock == nil {
+		return nil
+	}
+	return unlock()
 }
 
 // Option configures a Runtime.
@@ -176,6 +208,9 @@ func (r *Runtime) Execute(ctx context.Context, in Intent) (*Result, error) {
 			if e.Spec == nil {
 				return nil, fmt.Errorf("intent %q, effect %q: %w", in.ID, e.Name, ErrNotDurable)
 			}
+		}
+		if err := r.acquire(); err != nil {
+			return nil, err
 		}
 	}
 
@@ -330,6 +365,9 @@ func (r *Runtime) List() []*Result {
 func (r *Runtime) Recover(ctx context.Context) ([]*Result, error) {
 	if r.store == nil || r.registry == nil {
 		return nil, errors.New("recover needs both WithStore and WithRegistry")
+	}
+	if err := r.acquire(); err != nil {
+		return nil, err
 	}
 	snaps, loadErr := r.store.LoadAll()
 	var errs []error

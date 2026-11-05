@@ -19,8 +19,13 @@ jobs:
         run: go vet ./...
       - name: test
         run: go test -race ./...
-      - name: demo
-        run: go run ./cmd/demo
+      - name: demos
+        run: |
+          go run ./cmd/demo
+          go run ./cmd/storyline | tee story.txt
+          grep -q "verdict: BLOCKED" story.txt
+          grep -q "verdict: SAFE TO PROMOTE" story.txt
+          grep -q "world unchanged by either replay" story.txt
       - name: crash-recovery smoke test
         run: |
           go build -o agentctl ./cmd/agentctl
