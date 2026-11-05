@@ -230,6 +230,30 @@ func (e *explainer) explain(c Change) string {
 			}
 		}
 	}
+	// A delete now allowed because a rule was loosened or removed.
+	if op == "delete" && c.Old.Status == 409 && c.New.Status < 400 {
+		for _, or := range e.oldSpec.Resource.Rules {
+			oc := or.ForbidDeleteWhen
+			if oc == nil {
+				continue
+			}
+			name := fmt.Sprintf("no delete while %s is %v", oc.Field, oc.Equals)
+			found := false
+			for _, nr := range e.newSpec.Resource.Rules {
+				nc := nr.ForbidDeleteWhen
+				if nc == nil || nc.Field != oc.Field || fmt.Sprint(nc.Equals) != fmt.Sprint(oc.Equals) {
+					continue
+				}
+				found = true
+				if c.Request.Caller != "" && contains(nr.ExceptCallers, c.Request.Caller) && !contains(or.ExceptCallers, c.Request.Caller) {
+					return fmt.Sprintf("%s exempted from rule: %s", c.Request.Caller, name)
+				}
+			}
+			if !found {
+				return "rule removed: " + name
+			}
+		}
+	}
 	// A delete now refused by a new rule.
 	if op == "delete" && c.New.Status == 409 {
 		for _, r := range e.newRules {
@@ -462,4 +486,13 @@ func short(v any) string {
 		s = s[:87] + "..."
 	}
 	return s
+}
+
+func contains(xs []string, x string) bool {
+	for _, y := range xs {
+		if y == x {
+			return true
+		}
+	}
+	return false
 }

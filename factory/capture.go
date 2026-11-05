@@ -37,7 +37,7 @@ func Capture(ctx context.Context, m model.Completer, conversation []Turn, curren
 		return Captured{}, errors.New("capture needs a model")
 	}
 	var b strings.Builder
-	b.WriteString("SPEC FORMAT (fields: string, bool, int, number; rules: forbid_delete_when; examples run in order against a fresh instance and are the contract)\n")
+	b.WriteString("SPEC FORMAT (fields: string, bool, int, number; rules: forbid_delete_when, optionally except_callers; a request may name its caller; examples run in order against a fresh instance and are the contract)\n")
 	if current != nil {
 		b.WriteString("CURRENT SPECIFICATION\n" + current.JSON() + "\n")
 	} else {

@@ -14,7 +14,11 @@ In an agentic world, writing code is cheap. What's scarce is knowing exactly wha
 go run ./cmd/factory                        # offline: deterministic coder
 ANTHROPIC_API_KEY=sk-... go run ./cmd/factory  # Claude drafts the spec and writes the code
 go run ./cmd/factory -faulty-coder          # a coder with a migration bug, caught before release
+go run ./cmd/factory -show-prompts          # every prompt a model would be sent, calling nothing
+go run ./cmd/factory -keep                  # keep the generated code and data to read afterwards
 ```
+
+Before running with a real key, read [docs/RUNNING-WITH-CLAUDE.md](docs/RUNNING-WITH-CLAUDE.md): what the model does, what leaves your machine, what runs on it (model-written code is executed, so use a container), and a step-by-step ladder from no risk to a live run.
 
 A real service built, changed, released and rewound from conversation. Nobody writes or edits code.
 
@@ -25,7 +29,9 @@ A real service built, changed, released and rewound from conversation. Nobody wr
 5. **What would change, shown as behaviour.** The week's traffic is replayed through both versions: 17 requests would behave differently, and every one is traced to what Phil asked for (14 by the new field, 1 by the new rule, 2 as knock-on effects of that refused delete). Every existing flag is also read through both versions, to catch anything that misreads old data.
 6. **Phil signs off; v2 goes live** on the same production data.
 7. **A team's cleanup script breaks** on the new rule. Phil rewinds the *decision*; v1 is live again, with the data intact.
-8. **The intent is agreed again later.** Same intent, same software: the build comes from the cache, with nothing regenerated.
+8. **Production raises questions.** After another week, the factory compares everything v2 did with what v1 would have done from the same data. Two findings: the web team and the nightly cleanup bot each had deletes refused by the new rule. Each becomes a question for Phil, with intent changes as answers: keep refusing, exempt the caller, or drop the rule.
+9. **The answers are the new intent.** Phil keeps the rule for people and exempts the bot. v3 is generated, with four of its examples captured from the production requests, so the decision is now contract. Every behaviour change is traced to the exemption; a week later, no new findings.
+10. **Every decision stays reversible.** Phil rewinds his answer and v2 is live again on the same data; reaffirming it is served from the cache, with nothing regenerated.
 
 With `-faulty-coder`, the v2 build still passes all 12 examples, but reading production data through it shows every existing flag that was on silently dropping to 0% rollout. That change isn't explained by anything Phil asked for, so it isn't released. Examples alone would have shipped it.
 
@@ -33,7 +39,7 @@ With `-faulty-coder`, the v2 build still passes all 12 examples, but reading pro
 
 | Layer | Package | Answers | Key operation |
 |---|---|---|---|
-| **Factory** | `reversible/factory` | *Build the software itself from intent* | `Capture`, `Check`, `Build`, `Diff`, `DiffState`, `Router.Release` |
+| **Factory** | `reversible/factory` | *Build the software itself from intent, and let production revise it* | `Capture`, `Check`, `Build`, `Diff`, `DiffState`, `Router.Release`, `Observe`, `Propose` |
 | **Effect system** | `reversible` | *What happened, and can it be undone?* | `Execute`, `Undo`, `Release`, `Recover` |
 | **Decision ledger** | `reversible/decision` | *Why did it happen, and who decided?* | `Decide`, `Explain`, `Rewind`, `ChainLog` |
 | **Counterfactual runtime** | `reversible/counterfactual` | *What would this change do, and what would happen?* | `Replay`, `ReplayWith` + `Simulators` |

@@ -4,12 +4,15 @@
 //	go run ./cmd/factory                        # offline: deterministic coder
 //	ANTHROPIC_API_KEY=... go run ./cmd/factory  # Claude drafts the spec and writes the code
 //	go run ./cmd/factory -faulty-coder          # a coder with a migration bug: watch it get caught
+//	go run ./cmd/factory -show-prompts          # print every prompt a model would get, calling nothing
+//	go run ./cmd/factory -keep                  # keep the generated code and data to read afterwards
 package main
 
 import (
 	"context"
 	"embed"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"net/http/httptest"
@@ -39,17 +42,34 @@ var conversation2 = []factory.Turn{
 
 func main() {
 	faulty := flag.Bool("faulty-coder", false, "use a coder that forgets defaults when loading old data")
+	showPrompts := flag.Bool("show-prompts", false, "print exactly what a model would be sent at each step, without calling one")
+	keep := flag.Bool("keep", false, "keep the work directory (generated code, builds, production data) and print where it is")
 	flag.Parse()
 	ctx := context.Background()
+	// Errors unwind through the deferred cleanup (stopping every generated
+	// service process) before exiting, rather than os.Exit skipping it.
+	defer func() {
+		if r := recover(); r != nil {
+			f, ok := r.(fatal)
+			if !ok {
+				panic(r)
+			}
+			fmt.Fprintln(os.Stderr, "error:", f.err)
+			os.Exit(1)
+		}
+	}()
 	check := func(err error) {
 		if err != nil {
-			fmt.Fprintln(os.Stderr, "error:", err)
-			os.Exit(1)
+			panic(fatal{err})
 		}
 	}
 	work, err := os.MkdirTemp("", "factory-demo-")
 	check(err)
-	defer os.RemoveAll(work)
+	if *keep {
+		defer fmt.Printf("\nwork directory kept: %s\n  builds/<spec hash>/main.go   the generated code for each intent\n  production/flags.json*       production data, with a snapshot per release\n", work)
+	} else {
+		defer os.RemoveAll(work)
+	}
 
 	var coder factory.Coder = factory.Codegen{}
 	var m model.Completer
@@ -57,6 +77,23 @@ func main() {
 	if a, ok := model.FromEnv(); ok {
 		m, coder = a, factory.ModelCoder{Model: a}
 		who = "Claude drafts the spec from the conversation and writes the code"
+	}
+	var shower model.Completer
+	if *showPrompts && m == nil {
+		seen := map[string]bool{}
+		shower = model.Func(func(_ context.Context, system, prompt string) (string, error) {
+			if !seen[system+prompt] {
+				seen[system+prompt] = true
+				fmt.Printf("\n   ┌── what the model would be sent (not sent: -show-prompts) ──\n")
+				for _, l := range strings.Split("SYSTEM: "+system+"\n\n"+prompt, "\n") {
+					fmt.Println("   │ " + l)
+				}
+				fmt.Printf("   └──\n\n")
+			}
+			return "", errors.New("show-prompts: no model is called")
+		})
+		coder = showing{shower: shower, inner: coder}
+		who += "; -show-prompts: printing every model prompt, calling nothing"
 	}
 	if *faulty {
 		coder = forgetful{coder}
@@ -96,6 +133,9 @@ func main() {
 				fmt.Println("   ? (from Claude)", q)
 			}
 			return c.Spec
+		}
+		if shower != nil {
+			factory.Capture(ctx, shower, turns, current) // prints the prompt; the offline spec is used
 		}
 		b, err := intents.ReadFile("intent/" + file)
 		check(err)
@@ -203,26 +243,102 @@ func main() {
 	check(err)
 	sample := firstEnabled(ctx, prod.URL)
 	fmt.Printf("   live: %s. %s\n", router.Live().SpecHash, sample)
-	r, _ := factory.Call(ctx, prod.URL, factory.HTTPCall{Method: "DELETE", Path: "/flags/" + strings.Fields(sample)[0]})
+	r, _ := factory.Call(ctx, prod.URL, factory.HTTPCall{Method: "DELETE", Path: "/flags/" + strings.Fields(sample)[0], Caller: "web"})
 	fmt.Printf("   deleting it now: %d %s\n", r.Status, compact(r.Body))
 
-	// ── 5. Rewind ─────────────────────────────────────────────────────────
-	head("8 · A team's cleanup script breaks on the new delete rule. Phil rewinds the decision")
-	rep, err := g.Rewind(ctx, "intent-2", rt, "cleanup scripts depend on deleting enabled flags; revisit with that team", "phil")
+	// ── 5. Production is an input ─────────────────────────────────────────
+	head("8 · Another week in production. The factory watches what v2 actually did")
+	for _, c := range weekTwo() {
+		_, err := factory.Call(ctx, prod.URL, c)
+		check(err)
+	}
+	findings, err := factory.Observe(ctx, router)
 	check(err)
-	fmt.Printf("   rewound %s; live: %s (v1 again, same data)\n", strings.Join(rep.Rewound, " ← "), router.Live().SpecHash)
-	r, _ = factory.Call(ctx, prod.URL, factory.HTTPCall{Method: "GET", Path: "/flags"})
-	fmt.Printf("   flags still in production: %d\n", len(r.Body.([]any)))
+	fmt.Printf("   compared every request since the release with what v1 would have done from the same data: %d finding(s)\n", len(findings))
+	for _, f := range findings {
+		fmt.Println("   •", f)
+	}
 
-	head("9 · Later, the intent is agreed again. Same intent, same software: nothing is regenerated")
-	_, err = g.Decide(decision.Decision{ID: "intent-2b", Parents: []string{"intent-1"}, Actor: "phil",
-		Summary: "gradual rollout; no deleting flags that are on (agreed with the cleanup-script team)", Rationale: "same intent as intent-2, after the cleanup scripts were updated"})
+	head("9 · Each finding becomes a question for the owner, with intent changes as answers")
+	answers := map[string]string{"cleanup-bot": "exempt", "web": "keep"}
+	spec3 := spec2
+	var asked []string
+	for _, f := range findings {
+		prop := factory.Propose(f, spec3)
+		fmt.Println("   ?", prop.Question)
+		choice := -1
+		answer, ok := answers[f.Caller]
+		for i, o := range prop.Options {
+			mark := " "
+			if ok && choice < 0 && strings.HasPrefix(o.Label, answer) {
+				mark, choice = "→", i
+			}
+			fmt.Printf("     %s %d. %s\n", mark, i+1, o.Label)
+		}
+		if choice < 0 {
+			fmt.Println("     (left for later)")
+			continue
+		}
+		fmt.Printf("     Phil answers %d.\n", choice+1)
+		asked = append(asked, fmt.Sprintf("%s → %s", prop.Question, prop.Options[choice].Label))
+		spec3 = prop.Options[choice].Spec
+		_, err = g.Observe(decision.Outcome{ID: fmt.Sprintf("finding-%d", len(asked)), Parents: []string{"signoff-2"}, Actor: "factory",
+			Summary: f.String(), Metrics: map[string]float64{"requests": float64(f.Count)}})
+		check(err)
+	}
+	_, err = g.Decide(decision.Decision{ID: "intent-3", Parents: []string{"intent-2"}, Actor: "phil",
+		Summary: "answers to production's questions", Rationale: strings.Join(asked, " / ")})
 	check(err)
-	again, err := fab.Build(ctx, spec2)
-	check(err)
-	fmt.Print(indent(again.Report()))
 
-	finish(g, store, keys, totalGenerated, router, "wrote two short conversations, answered the spec's questions, signed off on behaviour twice, rewound one decision")
+	head("10 · The answers are the new intent. The factory regenerates")
+	v3, err := fab.Build(ctx, spec3)
+	if v3 != nil {
+		fmt.Print(indent(v3.Report()))
+	}
+	check(err)
+	totalGenerated += v3.Lines()
+	fmt.Printf("   %d of its %d examples were captured from production requests\n", len(spec3.Examples)-len(spec2.Examples), len(spec3.Examples))
+	d3, err := factory.Diff(ctx, router.Traffic(), v2, v3)
+	check(err)
+	fmt.Print(indent(d3.String()))
+	if len(d3.Unexpected()) > 0 {
+		check(fmt.Errorf("unexplained changes in v3"))
+	}
+	_, err = g.Decide(decision.Decision{ID: "signoff-3", Parents: []string{"intent-3"}, Actor: "phil",
+		Summary: "release flags " + v3.SpecHash, Rationale: "behaviour changes match the answers"})
+	check(err)
+	_, err = g.Execute(ctx, rt, "signoff-3", reversible.Intent{ID: "release-" + v3.SpecHash, Effects: []reversible.Effect{router.Release(v3)}})
+	check(err)
+	for _, c := range weekThree() {
+		_, err := factory.Call(ctx, prod.URL, c)
+		check(err)
+	}
+	after, err := factory.Observe(ctx, router)
+	check(err)
+	if len(after) == 0 {
+		fmt.Printf("   live: %s. A week later: no new findings; the cleanup bot's deletes work, everyone else still turns flags off first.\n", router.Live().SpecHash)
+	} else {
+		for _, f := range after {
+			fmt.Println("   •", f)
+		}
+	}
+
+	// ── 6. Every decision is reversible ───────────────────────────────────
+	head("11 · Every decision stays reversible. Phil rewinds his answer, then makes it again")
+	rep, err := g.Rewind(ctx, "intent-3", rt, "checking the rollback path", "phil")
+	check(err)
+	fmt.Printf("   rewound %s; live: %s (v2 again, same data)\n", strings.Join(rep.Rewound, " ← "), router.Live().SpecHash)
+	_, err = g.Decide(decision.Decision{ID: "intent-3b", Parents: []string{"intent-2"}, Actor: "phil",
+		Summary: "answers to production's questions, reaffirmed", Rationale: "same answers as intent-3"})
+	check(err)
+	again, err := fab.Build(ctx, spec3)
+	check(err)
+	fmt.Print(indent("same intent, same software: " + again.Report()))
+	_, err = g.Execute(ctx, rt, "intent-3b", reversible.Intent{ID: "release-" + again.SpecHash + "-again", Effects: []reversible.Effect{router.Release(again)}})
+	check(err)
+	fmt.Printf("   live: %s\n", router.Live().SpecHash)
+
+	finish(g, store, keys, totalGenerated, router, "wrote two short conversations, answered the spec's questions and production's, signed off on behaviour three times, rewound one decision")
 }
 
 func finish(g *decision.Graph, store decision.Log, keys *decision.Keyring, generated int, router *factory.Router, did string) {
@@ -237,7 +353,11 @@ func finish(g *decision.Graph, store decision.Log, keys *decision.Keyring, gener
 	}
 	fmt.Println()
 	if live := router.Live(); live != nil {
-		if why, err := g.ExplainIntent("release-" + live.SpecHash); err == nil {
+		why, err := g.ExplainIntent("release-" + live.SpecHash + "-again")
+		if err != nil {
+			why, err = g.ExplainIntent("release-" + live.SpecHash)
+		}
+		if err == nil {
 			fmt.Println("\n   why is this version live?")
 			fmt.Print(indent(indent(why)))
 		}
@@ -250,24 +370,53 @@ func teamWeek() []factory.HTTPCall {
 	teams := []string{"web", "search", "payments", "mobile"}
 	names := []string{"dark-mode", "new-search", "one-click-pay", "offline-sync", "beta-banner", "smart-sort", "fast-login", "push-v2"}
 	for i, n := range names {
-		out = append(out, factory.HTTPCall{Method: "POST", Path: "/flags", Body: map[string]any{"key": n, "owner": teams[i%len(teams)]}})
+		t := teams[i%len(teams)]
+		out = append(out, factory.HTTPCall{Method: "POST", Path: "/flags", Body: map[string]any{"key": n, "owner": t}, Caller: t})
 	}
 	out = append(out,
-		factory.HTTPCall{Method: "POST", Path: "/flags", Body: map[string]any{"key": "Holiday_Theme", "owner": "web"}},
-		factory.HTTPCall{Method: "POST", Path: "/flags", Body: map[string]any{"key": "dark-mode", "owner": "mobile"}},
+		factory.HTTPCall{Method: "POST", Path: "/flags", Body: map[string]any{"key": "Holiday_Theme", "owner": "web"}, Caller: "web"},
+		factory.HTTPCall{Method: "POST", Path: "/flags", Body: map[string]any{"key": "dark-mode", "owner": "mobile"}, Caller: "mobile"},
 	)
 	for _, n := range []string{"dark-mode", "one-click-pay", "fast-login", "smart-sort"} {
-		out = append(out, factory.HTTPCall{Method: "PATCH", Path: "/flags/" + n, Body: map[string]any{"enabled": true}})
+		out = append(out, factory.HTTPCall{Method: "PATCH", Path: "/flags/" + n, Body: map[string]any{"enabled": true}, Caller: "web"})
 	}
 	out = append(out,
-		factory.HTTPCall{Method: "GET", Path: "/flags/dark-mode"},
-		factory.HTTPCall{Method: "DELETE", Path: "/flags/beta-banner"},
-		factory.HTTPCall{Method: "PATCH", Path: "/flags/smart-sort", Body: map[string]any{"enabled": false}},
-		factory.HTTPCall{Method: "DELETE", Path: "/flags/smart-sort"},
-		factory.HTTPCall{Method: "DELETE", Path: "/flags/fast-login"},
-		factory.HTTPCall{Method: "GET", Path: "/flags"},
+		factory.HTTPCall{Method: "GET", Path: "/flags/dark-mode", Caller: "mobile"},
+		factory.HTTPCall{Method: "DELETE", Path: "/flags/beta-banner", Caller: "web"},
+		factory.HTTPCall{Method: "PATCH", Path: "/flags/smart-sort", Body: map[string]any{"enabled": false}, Caller: "search"},
+		factory.HTTPCall{Method: "DELETE", Path: "/flags/smart-sort", Caller: "search"},
+		factory.HTTPCall{Method: "DELETE", Path: "/flags/fast-login", Caller: "cleanup-bot"},
+		factory.HTTPCall{Method: "GET", Path: "/flags", Caller: "web"},
 	)
 	return out
+}
+
+// weekTwo: teams adopt rollouts; the nightly cleanup bot deletes stale
+// flags, some of which are still on; one person tries to delete a live one.
+func weekTwo() []factory.HTTPCall {
+	return []factory.HTTPCall{
+		{Method: "POST", Path: "/flags", Body: map[string]any{"key": "ai-summaries", "owner": "search"}, Caller: "search"},
+		{Method: "PATCH", Path: "/flags/ai-summaries", Body: map[string]any{"enabled": true, "rollout_percent": 10}, Caller: "search"},
+		{Method: "PATCH", Path: "/flags/ai-summaries", Body: map[string]any{"rollout_percent": 50}, Caller: "search"},
+		{Method: "PATCH", Path: "/flags/push-v2", Body: map[string]any{"enabled": true, "rollout_percent": 25}, Caller: "mobile"},
+		{Method: "DELETE", Path: "/flags/offline-sync", Caller: "cleanup-bot"},
+		{Method: "DELETE", Path: "/flags/one-click-pay", Caller: "cleanup-bot"},
+		{Method: "DELETE", Path: "/flags/ai-summaries", Caller: "cleanup-bot"},
+		{Method: "DELETE", Path: "/flags/push-v2", Caller: "web"},
+		{Method: "GET", Path: "/flags", Caller: "web"},
+	}
+}
+
+// weekThree: the same habits, under the answered intent.
+func weekThree() []factory.HTTPCall {
+	return []factory.HTTPCall{
+		{Method: "POST", Path: "/flags", Body: map[string]any{"key": "winter-theme", "owner": "web"}, Caller: "web"},
+		{Method: "PATCH", Path: "/flags/winter-theme", Body: map[string]any{"enabled": true}, Caller: "web"},
+		{Method: "DELETE", Path: "/flags/dark-mode", Caller: "cleanup-bot"},
+		{Method: "DELETE", Path: "/flags/winter-theme", Caller: "web"},
+		{Method: "PATCH", Path: "/flags/ai-summaries", Body: map[string]any{"rollout_percent": 100}, Caller: "search"},
+		{Method: "GET", Path: "/flags", Caller: "web"},
+	}
 }
 
 func firstEnabled(ctx context.Context, url string) string {
@@ -279,6 +428,20 @@ func firstEnabled(ctx context.Context, url string) string {
 		}
 	}
 	return ""
+}
+
+type fatal struct{ err error }
+
+// showing prints the prompt a model coder would be sent, then lets the
+// offline coder do the work.
+type showing struct {
+	shower model.Completer
+	inner  factory.Coder
+}
+
+func (s showing) Code(ctx context.Context, spec factory.ServiceSpec, prev map[string]string, fail []factory.Result) (map[string]string, error) {
+	factory.ModelCoder{Model: s.shower}.Code(ctx, spec, prev, fail)
+	return s.inner.Code(ctx, spec, prev, fail)
 }
 
 // forgetful wraps a coder and introduces a classic migration bug: records

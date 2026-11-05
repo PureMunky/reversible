@@ -49,6 +49,13 @@ jobs:
           grep -q "cached: intent unchanged" factory.txt
           grep -q "written or edited by a person: 0" factory.txt
           grep -q "chain verifies" factory.txt
+          grep -q "cleanup-bot has had 2 request(s) refused" factory.txt
+          grep -q "Phil answers 2" factory.txt
+          grep -q "were captured from production requests" factory.txt
+          grep -q "no new findings" factory.txt
+          go run ./cmd/factory -show-prompts | tee prompts.txt
+          grep -q "what the model would be sent (not sent: -show-prompts)" prompts.txt
+          ! pgrep -f "factory-demo-.*/service"
           go run ./cmd/factory -faulty-coder | tee faulty.txt
           grep -q "UNEXPLAINED" faulty.txt
           grep -q "Phil does NOT sign off" faulty.txt

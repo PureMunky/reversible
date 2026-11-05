@@ -38,14 +38,14 @@ If a change can't answer these, it is plumbing for some other idea.
 | Reversibility replaces permission | Releases, and every other effect, are declared and undoable; crash recovery | `reversible`, `factory` |
 | Behaviour is reviewed, not code | Recorded traffic replayed through both versions; every difference traced to the intent change that explains it (including knock-on effects); existing production data read through both versions; unexplained differences block sign-off | `factory`, `counterfactual` |
 | Releases become evolution | Gated challengers, significance testing, automatic rewind | `evolve` |
-| Production is an input | Recorded traffic and live data judge every change; outcomes calibrate models and drive the next proposals | `factory`, `counterfactual`, `synth` |
+| Production is an input | After each release, production traffic is compared with what the previous version would have done from the same data; refusals and failures become questions for the owner whose answers are new intent, and the production request becomes part of the contract | `factory`, `counterfactual`, `synth` |
 
 **First slice closed:** `go run ./cmd/factory` builds, changes, releases and rewinds a real service from conversation, with no person writing or editing code. Run it with `-faulty-coder` to watch a build that passes every example get stopped because it would silently change existing production data.
 
 **What's still open:**
 
 - **The spec language is small.** One resource, field validation, one kind of rule. Real services need several resources, relations, queries, auth and integrations.
-- **The offline coder is a compiler, not a model.** Without `ANTHROPIC_API_KEY`, the spec is written alongside each conversation and code comes from a deterministic generator. The Claude path (capture and coding, with a repair loop) is tested against scripted replies, not yet against a live model.
+- **The offline coder is a compiler, not a model.** Without `ANTHROPIC_API_KEY`, the spec is written alongside each conversation and code comes from a deterministic generator. The Claude path (capture and coding, with a repair loop) is tested against scripted replies, not yet against a live model; [docs/RUNNING-WITH-CLAUDE.md](docs/RUNNING-WITH-CLAUDE.md) is the guide for doing that safely.
 - **Releases are all at once.** The factory's versions aren't yet released through `evolve`'s gated challengers and live statistics.
-- **Production doesn't yet write intent.** Incidents and outcomes are inputs to judging changes, not yet turned into proposed intent changes or questions.
-- **Replay assumes a known starting state.** Recorded traffic is replayed from empty; snapshots would remove that limit.
+- **Production findings are narrow.** Observe finds new refusals and server errors; it doesn't yet notice latency, business outcomes, or behaviour that's wrong but not an error. The answers it offers are fixed per finding type; a model could propose richer intent changes.
+- **Behaviour diffs replay from empty state.** Observe now uses a snapshot taken at each release; pre-release diffs still replay all traffic from empty.

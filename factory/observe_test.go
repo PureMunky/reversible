@@ -179,3 +179,30 @@ func TestNothingToObserveBeforeTraffic(t *testing.T) {
 		t.Fatalf("%v %v", fs, err)
 	}
 }
+
+func TestLooseningChangesAreExplained(t *testing.T) {
+	ctx := context.Background()
+	v2 := build(t, spec(t, "flags-v2.json"))
+	f := Finding{Kind: NewRefusal, Caller: "cleanup-bot", Because: "new rule: no delete while enabled is true", Count: 1, Since: v2.SpecHash,
+		Requests: []Exchange{{Request: del("x", "cleanup-bot"), Response: Response{Status: 409}}}, Previous: []Response{{Status: 204}}}
+	prop := Propose(f, v2.Spec)
+	traffic := []Exchange{
+		{Request: create("x", "web")}, {Request: enable("x")},
+		{Request: del("x", "cleanup-bot")}, // exempt under v3
+		{Request: create("y", "web")}, {Request: enable("y")},
+		{Request: del("y", "web")}, // still refused under the exemption; allowed when the rule is dropped
+	}
+	for i, want := range map[int][]string{
+		1: {"cleanup-bot exempted from rule: no delete while enabled is true"},
+		2: {"rule removed: no delete while enabled is true"},
+	} {
+		v := build(t, prop.Options[i].Spec)
+		d, err := Diff(ctx, traffic, v2, v)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(d.Unexpected()) != 0 || !strings.Contains(d.String(), want[0]) {
+			t.Fatalf("option %q:\n%s", prop.Options[i].Label, d)
+		}
+	}
+}
