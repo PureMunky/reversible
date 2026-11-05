@@ -9,15 +9,18 @@ import (
 	"net/http"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/PureMunky/reversible"
 )
 
 // Exchange is one recorded request and the response production gave.
 type Exchange struct {
-	Request  HTTPCall `json:"request"`
-	Response Response `json:"response"`
-	Version  string   `json:"version"` // spec hash that served it
+	ID        string   `json:"id"`
+	Request   HTTPCall `json:"request"`
+	Response  Response `json:"response"`
+	Version   string   `json:"version"` // spec hash that served it
+	LatencyMS float64  `json:"latency_ms"`
 }
 
 // Router is production: it forwards traffic to the live version, records
@@ -31,6 +34,20 @@ type Router struct {
 	inst    *Instance
 	traffic []Exchange
 	marks   []ReleaseMark
+	seq     int
+
+	// A canary: a second version taking a share of traffic.
+	canary     *Version
+	canaryInst *Instance
+	toCanary   func(id string) bool         // which requests the canary serves
+	outcome    func(id string, ex Exchange) // told about every exchange
+}
+
+// Canary returns the version serving canary traffic, if any.
+func (r *Router) Canary() *Version {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.canary
 }
 
 // ReleaseMark records a change of live version: what was live before,
@@ -84,12 +101,22 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, `{"error":"no version is live"}`, http.StatusServiceUnavailable)
 		return
 	}
-	resp, err := Call(req.Context(), r.inst.URL, call)
-	if err != nil {
-		http.Error(w, `{"error":"live version unreachable"}`, http.StatusBadGateway)
-		return
+	r.seq++
+	id := fmt.Sprintf("r%06d", r.seq)
+	inst, version := r.inst, r.live
+	if r.canaryInst != nil && r.toCanary != nil && r.toCanary(id) {
+		inst, version = r.canaryInst, r.canary
 	}
-	r.traffic = append(r.traffic, Exchange{Request: call, Response: resp, Version: r.live.SpecHash})
+	start := time.Now()
+	resp, err := Call(req.Context(), inst.URL, call)
+	if err != nil {
+		resp = Response{Status: http.StatusBadGateway, Body: map[string]any{"error": "version unreachable"}}
+	}
+	ex := Exchange{ID: id, Request: call, Response: resp, Version: version.SpecHash, LatencyMS: float64(time.Since(start).Microseconds()) / 1000}
+	r.traffic = append(r.traffic, ex)
+	if r.outcome != nil {
+		r.outcome(id, ex)
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(resp.Status)
 	if resp.Body != nil {
@@ -113,6 +140,15 @@ func (r *Router) swap(ctx context.Context, v *Version) (*Version, error) {
 	}
 	r.mu.Lock()
 	prev, old := r.live, r.inst
+	r.marks = append(r.marks, r.markLocked(v, prev))
+	r.live, r.inst = v, inst
+	r.mu.Unlock()
+	old.Stop()
+	return prev, nil
+}
+
+// markLocked records a release, snapshotting production data.
+func (r *Router) markLocked(v, prev *Version) ReleaseMark {
 	mark := ReleaseMark{Version: v, Previous: prev, TrafficIndex: len(r.traffic)}
 	if data, err := os.ReadFile(r.DataPath); err == nil {
 		mark.Snapshot = fmt.Sprintf("%s.release-%d", r.DataPath, len(r.marks)+1)
@@ -120,16 +156,103 @@ func (r *Router) swap(ctx context.Context, v *Version) (*Version, error) {
 			mark.Snapshot = ""
 		}
 	}
-	r.marks = append(r.marks, mark)
-	r.live, r.inst = v, inst
+	return mark
+}
+
+// Stop takes the service down, canary included.
+func (r *Router) Stop() {
+	r.endCanary()
+	r.swap(context.Background(), nil)
+}
+
+// startCanary runs v alongside the live version on the same data, serving
+// the requests toCanary picks; outcome hears about every exchange.
+func (r *Router) startCanary(ctx context.Context, v *Version, toCanary func(string) bool, outcome func(string, Exchange)) error {
+	if r.Live() == nil {
+		return errors.New("a canary needs a live version to run beside")
+	}
+	if r.Canary() != nil {
+		return errors.New("a canary is already running")
+	}
+	inst, err := Start(ctx, v.Binary, r.DataPath)
+	if err != nil {
+		return fmt.Errorf("starting canary %s: %w", v.SpecHash, err)
+	}
+	r.mu.Lock()
+	r.canary, r.canaryInst, r.toCanary, r.outcome = v, inst, toCanary, outcome
+	r.mu.Unlock()
+	return nil
+}
+
+// endCanary stops the canary; all traffic goes to the live version.
+func (r *Router) endCanary() {
+	r.mu.Lock()
+	inst := r.canaryInst
+	r.canary, r.canaryInst, r.toCanary, r.outcome = nil, nil, nil, nil
+	r.mu.Unlock()
+	inst.Stop()
+}
+
+// promoteCanary makes the running canary the live version, recording a
+// release mark, and stops the old live version. It returns the old one.
+func (r *Router) promoteCanary() (*Version, error) {
+	r.mu.Lock()
+	if r.canaryInst == nil {
+		r.mu.Unlock()
+		return nil, errors.New("no canary to promote")
+	}
+	prev, old := r.live, r.inst
+	r.marks = append(r.marks, r.markLocked(r.canary, prev))
+	r.live, r.inst = r.canary, r.canaryInst
+	r.canary, r.canaryInst, r.toCanary, r.outcome = nil, nil, nil, nil
 	r.mu.Unlock()
 	old.Stop()
 	return prev, nil
 }
 
-// Stop takes the service down.
-func (r *Router) Stop() {
-	r.swap(context.Background(), nil)
+// CanaryEffect starts v as a canary. Undoing it stops the canary, so
+// rewinding the decision behind it takes the canary away.
+func (r *Router) CanaryEffect(v *Version, toCanary func(string) bool, outcome func(string, Exchange)) reversible.Effect {
+	return reversible.Effect{
+		Name:        "canary",
+		Class:       reversible.Reversible,
+		Description: fmt.Sprintf("run %s (spec %s) as a canary", v.Spec.Service, v.SpecHash),
+		Do: func(ctx context.Context) (reversible.Receipt, error) {
+			if err := r.startCanary(ctx, v, toCanary, outcome); err != nil {
+				return nil, err
+			}
+			return reversible.Receipt{"canary": v.SpecHash}, nil
+		},
+		Undo: func(context.Context, reversible.Receipt) error {
+			if c := r.Canary(); c == v {
+				r.endCanary()
+			}
+			return nil
+		},
+	}
+}
+
+// PromoteEffect makes the canary live. Undoing it puts the previous
+// version back.
+func (r *Router) PromoteEffect() reversible.Effect {
+	var prev *Version
+	return reversible.Effect{
+		Name:  "promote",
+		Class: reversible.Reversible,
+		Do: func(context.Context) (reversible.Receipt, error) {
+			c := r.Canary()
+			p, err := r.promoteCanary()
+			if err != nil {
+				return nil, err
+			}
+			prev = p
+			return reversible.Receipt{"from": p.SpecHash, "to": c.SpecHash}, nil
+		},
+		Undo: func(ctx context.Context, _ reversible.Receipt) error {
+			_, err := r.swap(ctx, prev)
+			return err
+		},
+	}
 }
 
 // Release is the effect of putting a version live. It is reversible: its
