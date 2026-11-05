@@ -87,6 +87,11 @@ func NoRiseOver(metric string, pct float64) Guardrail {
 	return Guardrail{Metric: metric, LimitPct: pct, Rise: true}
 }
 
+// Check returns a description of the breach, or "" if the guardrail holds.
+// It works on any baseline/candidate pair: predicted totals during replay,
+// or observed averages from live traffic.
+func (g Guardrail) Check(ms []MetricChange) string { return g.check(ms) }
+
 func (g Guardrail) check(ms []MetricChange) string {
 	for _, m := range ms {
 		if m.Metric != g.Metric {
