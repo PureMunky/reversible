@@ -3,7 +3,8 @@
 #
 # The pod runs the demo's whole story (build, release, canary, findings),
 # then keeps production serving on 8080 with an inspector at /_factory/
-# until the Job is deleted or two hours pass.
+# until the Job is deleted or two hours pass. Telemetry (/metrics,
+# /_factory/events, /_factory/live) is served on 8080 from the start.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -17,6 +18,10 @@ spec:
   activeDeadlineSeconds: 7200
   template:
     metadata:
+      annotations: # for any Prometheus that discovers pods by annotation
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: /metrics
       labels:
         app.kubernetes.io/name: reversible-demo
         reversible/mode: __MODE__
@@ -41,10 +46,11 @@ spec:
                 name: __ENVNAME__
           env:
             - {name: REVERSIBLE_MODEL, value: "__MODEL__"}
+            - {name: REVERSIBLE_MAX_TOKENS, value: "__MAXTOKENS__"}
           ports:
             - {name: http, containerPort: 8080}
-          readinessProbe: # ready once the story is over and production is serving
-            httpGet: {path: /_factory/, port: http}
+          readinessProbe: # ready once the story is over (telemetry is served from the start)
+            httpGet: {path: /_factory/ready, port: http}
             periodSeconds: 3
           securityContext:
             allowPrivilegeEscalation: false

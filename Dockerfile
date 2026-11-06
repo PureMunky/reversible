@@ -1,6 +1,6 @@
 # The demos, plus the Go toolchain they need at runtime: the factory
 # compiles every version of the generated service inside the container.
-# Built for deploy/kind (see docs/KIND.md); nothing here is kind-specific.
+# Built for deploy/kind (see docs/USER-GUIDE.md); nothing here is kind-specific.
 FROM golang:1.24-alpine AS build
 WORKDIR /src
 COPY go.mod ./

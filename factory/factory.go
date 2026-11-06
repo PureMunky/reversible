@@ -1,9 +1,12 @@
 package factory
 
 import (
+	"time"
+
 	"context"
 	"errors"
 	"fmt"
+	"github.com/PureMunky/reversible/telemetry"
 	"os"
 	"path/filepath"
 	"sort"
@@ -79,16 +82,19 @@ func (e *QuestionsError) Is(t error) bool { return t == ErrNotReady }
 // a pure function of the intent. A build that doesn't pass the examples
 // is fed back to the coder, with the failures, up to MaxAttempts times.
 func (f *Factory) Build(ctx context.Context, spec ServiceSpec) (*Version, error) {
-	if qs := spec.Check(); !Ready(qs) {
-		var blocking []Question
-		for _, q := range qs {
-			if q.Severity == Blocking {
-				blocking = append(blocking, q)
-			}
+	hash := spec.Hash()
+	qs := spec.Check()
+	var blocking []Question
+	for _, q := range qs {
+		if q.Severity == Blocking {
+			blocking = append(blocking, q)
 		}
+	}
+	tel.Emit("spec.checked", telemetry.F{"service": spec.Service, "spec": telemetry.Short(hash), "blocking": len(blocking), "clarify": len(qs) - len(blocking)})
+	if !Ready(qs) {
+		mBuilds.Inc(spec.Service, "blocked")
 		return nil, &QuestionsError{Questions: blocking}
 	}
-	hash := spec.Hash()
 	f.mu.Lock()
 	if f.cache == nil {
 		f.cache = map[string]*Version{}
@@ -97,6 +103,8 @@ func (f *Factory) Build(ctx context.Context, spec ServiceSpec) (*Version, error)
 		f.mu.Unlock()
 		c := *v
 		c.Cached = true
+		mBuilds.Inc(spec.Service, "cached")
+		tel.Emit("build.finished", telemetry.F{"service": spec.Service, "spec": telemetry.Short(hash), "outcome": "cached"})
 		return &c, nil
 	}
 	f.mu.Unlock()
@@ -110,6 +118,23 @@ func (f *Factory) Build(ctx context.Context, spec ServiceSpec) (*Version, error)
 		max = 3
 	}
 	v := &Version{SpecHash: hash, Spec: spec, Dir: filepath.Join(f.Root, hash)}
+	started, cname := time.Now(), coderName(coder)
+	tel.Emit("build.started", telemetry.F{"service": spec.Service, "spec": telemetry.Short(hash), "coder": cname, "examples": len(spec.Examples)})
+	attempt := func(result string, f telemetry.F) {
+		mAttempts.Inc(spec.Service, cname, result)
+		f["service"], f["spec"], f["attempt"], f["result"] = spec.Service, telemetry.Short(hash), v.Attempts, result
+		tel.Emit("build.attempt", f)
+	}
+	finish := func(outcome string) {
+		mBuilds.Inc(spec.Service, outcome)
+		mBuildSecs.Observe(since(started), spec.Service)
+		ev := telemetry.F{"service": spec.Service, "spec": telemetry.Short(hash), "outcome": outcome, "attempts": v.Attempts, "seconds": since(started)}
+		if outcome == "passed" {
+			mGenLines.Set(float64(v.Lines()), spec.Service, telemetry.Short(hash))
+			ev["lines"] = v.Lines()
+		}
+		tel.Emit("build.finished", ev)
+	}
 	var prev map[string]string
 	var failures []Result
 	var lastErr error
@@ -117,6 +142,8 @@ func (f *Factory) Build(ctx context.Context, spec ServiceSpec) (*Version, error)
 		v.Attempts++
 		files, err := coder.Code(ctx, spec, prev, failures)
 		if err != nil {
+			attempt("coder_error", telemetry.F{"error": err.Error()})
+			finish("failed")
 			return v, fmt.Errorf("attempt %d: %w", v.Attempts, err)
 		}
 		v.Files, prev = files, files
@@ -124,29 +151,39 @@ func (f *Factory) Build(ctx context.Context, spec ServiceSpec) (*Version, error)
 		bin, err := compile(ctx, v.Dir, files)
 		if err != nil {
 			failures, lastErr = []Result{{Problem: err.Error()}}, err
+			attempt("compile_failed", telemetry.F{"error": firstLine(strings.TrimPrefix(err.Error(), "build failed:\n"), 300)})
 			continue
 		}
 		v.Binary = bin
 		results, err := runExamples(ctx, bin, spec.Examples)
 		if err != nil {
 			failures, lastErr = []Result{{Problem: "running the service: " + err.Error()}}, err
+			attempt("compile_failed", telemetry.F{"error": "running the service: " + err.Error()})
 			continue
 		}
 		v.Results = results
 		failures = nil
+		var failed []string
 		for _, r := range results {
 			if !r.Pass {
 				failures = append(failures, r)
+				failed = append(failed, r.Example.Name)
 			}
 		}
+		mExamples.Add(float64(len(results)-len(failures)), spec.Service, "pass")
+		mExamples.Add(float64(len(failures)), spec.Service, "fail")
 		if len(failures) == 0 {
+			attempt("passed", telemetry.F{"examples": len(results)})
 			f.mu.Lock()
 			f.cache[hash] = v
 			f.mu.Unlock()
+			finish("passed")
 			return v, nil
 		}
+		attempt("examples_failed", telemetry.F{"examples": len(results), "failed": failed})
 		lastErr = fmt.Errorf("%d of %d examples failed", len(failures), len(results))
 	}
+	finish("failed")
 	return v, fmt.Errorf("no passing build after %d attempts: %w", v.Attempts, lastErr)
 }
 
@@ -175,4 +212,14 @@ func (v *Version) Report() string {
 		b.WriteString(n + "\n")
 	}
 	return b.String()
+}
+
+func firstLine(s string, max int) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		s = s[:i]
+	}
+	if len(s) > max {
+		s = s[:max]
+	}
+	return s
 }

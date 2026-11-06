@@ -113,6 +113,16 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		resp = Response{Status: http.StatusBadGateway, Body: map[string]any{"error": "version unreachable"}}
 	}
 	ex := Exchange{ID: id, Request: call, Response: resp, Version: version.SpecHash, LatencyMS: float64(time.Since(start).Microseconds()) / 1000}
+	role := "live"
+	if version == r.canary {
+		role = "canary"
+	}
+	short := ex.Version
+	if len(short) > 12 {
+		short = short[:12]
+	}
+	mRequests.Inc(version.Spec.Service, short, role, call.Method, resourceOf(call.Path), fmt.Sprint(resp.Status))
+	mReqSecs.Observe(time.Since(start).Seconds(), version.Spec.Service, short, role)
 	r.traffic = append(r.traffic, ex)
 	if r.outcome != nil {
 		r.outcome(id, ex)
@@ -128,6 +138,14 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 // It returns the version that was live before (nil if none). Passing nil
 // takes the service down.
 func (r *Router) swap(ctx context.Context, v *Version) (*Version, error) {
+	action := "release"
+	if v == nil {
+		action = "stop"
+	}
+	return r.swapAs(ctx, v, action)
+}
+
+func (r *Router) swapAs(ctx context.Context, v *Version, action string) (*Version, error) {
 	var inst *Instance
 	if v != nil {
 		if v.Binary == "" {
@@ -144,6 +162,9 @@ func (r *Router) swap(ctx context.Context, v *Version) (*Version, error) {
 	r.live, r.inst = v, inst
 	r.mu.Unlock()
 	old.Stop()
+	if prev != nil || v != nil {
+		r.publishRouting(action, prev, v)
+	}
 	return prev, nil
 }
 
@@ -181,16 +202,20 @@ func (r *Router) startCanary(ctx context.Context, v *Version, toCanary func(stri
 	r.mu.Lock()
 	r.canary, r.canaryInst, r.toCanary, r.outcome = v, inst, toCanary, outcome
 	r.mu.Unlock()
+	r.publishRouting("canary_started", r.Live(), v)
 	return nil
 }
 
 // endCanary stops the canary; all traffic goes to the live version.
 func (r *Router) endCanary() {
 	r.mu.Lock()
-	inst := r.canaryInst
+	inst, was := r.canaryInst, r.canary
 	r.canary, r.canaryInst, r.toCanary, r.outcome = nil, nil, nil, nil
 	r.mu.Unlock()
 	inst.Stop()
+	if was != nil {
+		r.publishRouting("canary_ended", was, r.Live())
+	}
 }
 
 // promoteCanary makes the running canary the live version, recording a
@@ -207,6 +232,7 @@ func (r *Router) promoteCanary() (*Version, error) {
 	r.canary, r.canaryInst, r.toCanary, r.outcome = nil, nil, nil, nil
 	r.mu.Unlock()
 	old.Stop()
+	r.publishRouting("promote", prev, r.Live())
 	return prev, nil
 }
 
@@ -249,7 +275,7 @@ func (r *Router) PromoteEffect() reversible.Effect {
 			return reversible.Receipt{"from": p.SpecHash, "to": c.SpecHash}, nil
 		},
 		Undo: func(ctx context.Context, _ reversible.Receipt) error {
-			_, err := r.swap(ctx, prev)
+			_, err := r.swapAs(ctx, prev, "rollback")
 			return err
 		},
 	}
@@ -277,7 +303,7 @@ func (r *Router) Release(v *Version) reversible.Effect {
 			return reversible.Receipt{"from": from, "to": v.SpecHash}, nil
 		},
 		Undo: func(ctx context.Context, _ reversible.Receipt) error {
-			_, err := r.swap(ctx, prev)
+			_, err := r.swapAs(ctx, prev, "rollback")
 			return err
 		},
 	}

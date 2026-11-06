@@ -15,6 +15,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/PureMunky/reversible/telemetry"
 	"sort"
 	"strings"
 	"sync"
@@ -372,7 +373,37 @@ func (g *Graph) write(r Record) error {
 	if err := g.log.Append(r); err != nil {
 		return err
 	}
-	return g.applyLocked(r)
+	if err := g.applyLocked(r); err != nil {
+		return err
+	}
+	publish(r)
+	return nil
+}
+
+var mRecords = telemetry.Default.Counter("reversible_ledger_records_total", "Decision ledger records by type: goal, decision, outcome, execution, rewind.", "type", "actor")
+
+// publish reports a ledger record: the history of decisions, as it's
+// written, for anyone watching from outside.
+func publish(r Record) {
+	f := telemetry.F{"actor": r.Actor}
+	typ := string(r.Type)
+	switch r.Type {
+	case RecordNode:
+		typ = string(r.Node.Kind)
+		f["id"], f["summary"] = r.Node.ID, r.Node.Summary
+		if len(r.Node.Parents) > 0 {
+			f["parents"] = r.Node.Parents
+		}
+	case RecordExecution:
+		f["decision"], f["intent"] = r.NodeID, r.IntentID
+	case RecordRewind:
+		f["id"], f["rewind_of"], f["reason"] = r.NodeID, r.RewindOf, r.Reason
+	}
+	if r.Seq > 0 {
+		f["seq"], f["hash"] = r.Seq, telemetry.Short(r.Hash)
+	}
+	mRecords.Inc(typ, r.Actor)
+	telemetry.Emit("ledger."+typ, f)
 }
 
 func (g *Graph) check(r Record) error {

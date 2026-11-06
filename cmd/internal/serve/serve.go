@@ -1,5 +1,6 @@
-// Package serve keeps a demo's production running after its story ends,
-// so the software built from intent can be used and inspected directly:
+// Package serve exposes a demo's production while its story runs and
+// after it ends, so the software built from intent can be watched, used
+// and inspected directly: telemetry from the first moment,
 // requests go to whichever version is live (and are recorded like any
 // other production traffic), and /_factory/ shows what that version is
 // and why it exists, without reading any code to understand it.
@@ -19,6 +20,7 @@ import (
 	"time"
 
 	"github.com/PureMunky/reversible/factory"
+	"github.com/PureMunky/reversible/telemetry"
 )
 
 // Info is what the inspector can show beyond the router itself.
@@ -90,6 +92,9 @@ func Handler(router *factory.Router, info Info) http.Handler {
 			{"/_factory/why", "the decisions behind the live version, back to the conversation"},
 			{"/_factory/traffic", "the most recent production requests and which version served each"},
 			{"/_factory/code", "the generated code (a cache: change the intent, not this)"},
+			{"/_factory/live", "a live view: what's happening, as it happens"},
+			{"/_factory/events", "every event as JSON (?after=seq, ?kind=prefix, ?stream=1 to follow)"},
+			{"/metrics", "Prometheus metrics"},
 		} {
 			fmt.Fprintf(&b, "  %-20s %s\n", l[0], l[1])
 		}
@@ -161,30 +166,70 @@ func Handler(router *factory.Router, info Info) http.Handler {
 	return mux
 }
 
-// Run serves until SIGINT or SIGTERM (a pod being deleted), then returns
-// so the caller's cleanup runs.
-func Run(addr string, router *factory.Router, info Info) error {
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+// Server is production plus the inspector and telemetry, listening from
+// the start of a run so it can be watched while the story happens.
+type Server struct {
+	srv   *http.Server
+	ready chan struct{}
+	errs  chan error
+	addr  net.Addr
+}
+
+// Start listens on addr and serves until Close. /_factory/ready answers
+// 503 until Ready is called.
+func Start(addr string, router *factory.Router, info Info) (*Server, error) {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	srv := &http.Server{Handler: Handler(router, info), ReadHeaderTimeout: 10 * time.Second}
-	fmt.Printf("\n━━━ Serving production on %s until stopped\n", ln.Addr())
+	s := &Server{ready: make(chan struct{}), errs: make(chan error, 1), addr: ln.Addr()}
+	mux := http.NewServeMux()
+	mux.Handle("/", Handler(router, info))
+	mux.Handle("GET /metrics", telemetry.Default.MetricsHandler())
+	mux.Handle("GET /_factory/events", telemetry.Default.EventsHandler())
+	mux.HandleFunc("GET /_factory/live", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "text/html; charset=utf-8")
+		fmt.Fprint(w, livePage)
+	})
+	mux.HandleFunc("GET /_factory/ready", func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-s.ready:
+			fmt.Fprintln(w, "ready")
+		default:
+			http.Error(w, "the story is still running", http.StatusServiceUnavailable)
+		}
+	})
+	s.srv = &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	go func() { s.errs <- s.srv.Serve(ln) }()
+	fmt.Printf("telemetry: http://%s/metrics (Prometheus), /_factory/events (events; ?stream=1 to follow), /_factory/live\n", ln.Addr())
+	return s, nil
+}
+
+// Ready marks the story finished, then serves until SIGINT or SIGTERM (a
+// pod being deleted).
+func (s *Server) Ready() error {
+	close(s.ready)
+	telemetry.Emit("story.serving", telemetry.F{"addr": s.addr.String()})
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	fmt.Printf("\n━━━ Serving production on %s until stopped\n", s.addr)
 	fmt.Println("   /             the live version (requests are recorded like any production traffic)")
 	fmt.Println("   /_factory/    what's live, the intent behind it, its contract, its decisions and its code")
-	errs := make(chan error, 1)
-	go func() { errs <- srv.Serve(ln) }()
+	fmt.Println("   /metrics, /_factory/events, /_factory/live    telemetry")
 	select {
 	case <-ctx.Done():
 		fmt.Println("   stopping")
-		shut, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		return srv.Shutdown(shut)
-	case err := <-errs:
+		return nil
+	case err := <-s.errs:
 		return err
 	}
+}
+
+// Close stops serving.
+func (s *Server) Close() {
+	shut, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	s.srv.Shutdown(shut)
 }
 
 func short(h string) string {

@@ -1,0 +1,208 @@
+# Prometheus and Grafana, for watching the system from outside: they
+# scrape the demo's /metrics (the same numbers /_factory/live shows) and
+# chart the path from intent to production. Optional: `run.sh observe`.
+# The dashboard is deploy/kind/observe/dashboard.json, loaded as a
+# ConfigMap by run.sh. Local use only: Grafana has anonymous admin.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: observe
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+---
+# The one way into the demo namespace from inside the cluster: Prometheus
+# may scrape the demo pod's port.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-prometheus-scrape
+  namespace: reversible
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: reversible-demo
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observe
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prometheus
+      ports:
+        - {protocol: TCP, port: 8080}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus
+  namespace: observe
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 5s
+      evaluation_interval: 5s
+    scrape_configs:
+      - job_name: reversible
+        metrics_path: /metrics
+        static_configs:
+          - targets: [demo.reversible.svc.cluster.local:8080]
+      - job_name: prometheus
+        static_configs:
+          - targets: [localhost:9090]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: observe
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app.kubernetes.io/name: prometheus}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: prometheus}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        fsGroup: 65534
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: prometheus
+          image: prom/prometheus:v2.55.1
+          args: [--config.file=/etc/prometheus/prometheus.yml, --storage.tsdb.path=/prometheus, --storage.tsdb.retention.time=1d]
+          ports:
+            - {name: http, containerPort: 9090}
+          readinessProbe:
+            httpGet: {path: /-/ready, port: http}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          resources:
+            requests: {cpu: 50m, memory: 128Mi}
+            limits: {cpu: 500m, memory: 512Mi}
+          volumeMounts:
+            - {name: config, mountPath: /etc/prometheus}
+            - {name: data, mountPath: /prometheus}
+      volumes:
+        - name: config
+          configMap: {name: prometheus}
+        - name: data
+          emptyDir: {sizeLimit: 1Gi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: observe
+spec:
+  selector: {app.kubernetes.io/name: prometheus}
+  ports:
+    - {name: http, port: 9090, targetPort: 9090}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-provisioning
+  namespace: observe
+data:
+  datasource.yaml: |
+    apiVersion: 1
+    datasources:
+      - name: Prometheus
+        uid: prom
+        type: prometheus
+        access: proxy
+        url: http://prometheus.observe.svc.cluster.local:9090
+        isDefault: true
+        jsonData: {timeInterval: 5s}
+  dashboards.yaml: |
+    apiVersion: 1
+    providers:
+      - name: reversible
+        folder: ""
+        type: file
+        options: {path: /var/lib/grafana/dashboards}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+  namespace: observe
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app.kubernetes.io/name: grafana}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: grafana}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 472
+        runAsGroup: 472
+        fsGroup: 472
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: grafana
+          image: grafana/grafana:11.3.0
+          env:
+            - {name: GF_AUTH_ANONYMOUS_ENABLED, value: "true"}
+            - {name: GF_AUTH_ANONYMOUS_ORG_ROLE, value: Admin}
+            - {name: GF_AUTH_DISABLE_LOGIN_FORM, value: "true"}
+            - {name: GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH, value: /var/lib/grafana/dashboards/dashboard.json}
+            - {name: GF_ANALYTICS_REPORTING_ENABLED, value: "false"}
+            - {name: GF_ANALYTICS_CHECK_FOR_UPDATES, value: "false"}
+            - {name: GF_PATHS_PROVISIONING, value: /etc/grafana/provisioning}
+            - {name: GF_PATHS_DATA, value: /var/lib/grafana/data} # the root filesystem is read-only
+            - {name: GF_PATHS_LOGS, value: /var/lib/grafana/data/log}
+            - {name: GF_PATHS_PLUGINS, value: /var/lib/grafana/data/plugins}
+          ports:
+            - {name: http, containerPort: 3000}
+          readinessProbe:
+            httpGet: {path: /api/health, port: http}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          resources:
+            requests: {cpu: 50m, memory: 128Mi}
+            limits: {cpu: 500m, memory: 512Mi}
+          volumeMounts:
+            - {name: datasources, mountPath: /etc/grafana/provisioning/datasources}
+            - {name: providers, mountPath: /etc/grafana/provisioning/dashboards}
+            - {name: dashboards, mountPath: /var/lib/grafana/dashboards}
+            - {name: data, mountPath: /var/lib/grafana/data}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: datasources
+          configMap:
+            name: grafana-provisioning
+            items: [{key: datasource.yaml, path: datasource.yaml}]
+        - name: providers
+          configMap:
+            name: grafana-provisioning
+            items: [{key: dashboards.yaml, path: dashboards.yaml}]
+        - name: dashboards
+          configMap: {name: grafana-dashboard}
+        - name: data
+          emptyDir: {sizeLimit: 512Mi}
+        - name: tmp
+          emptyDir: {sizeLimit: 256Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana
+  namespace: observe
+spec:
+  selector: {app.kubernetes.io/name: grafana}
+  ports:
+    - {name: http, port: 3000, targetPort: 3000}

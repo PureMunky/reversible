@@ -35,6 +35,7 @@ import (
 	"github.com/PureMunky/reversible/decision"
 	"github.com/PureMunky/reversible/factory"
 	"github.com/PureMunky/reversible/model"
+	"github.com/PureMunky/reversible/telemetry"
 )
 
 //go:embed intent/*.json
@@ -106,16 +107,27 @@ func main() {
 	prod := httptest.NewServer(router)
 	defer prod.Close()
 	rt := reversible.New()
+	closeSink, err := telemetry.SinkFromEnv()
+	check(err)
+	defer closeSink()
 	if *serveAddr != "" {
+		// Production, the inspector and telemetry listen from the start, so
+		// the run can be watched while it happens.
+		srv, err := serve.Start(*serveAddr, router, serve.Info{Why: func() string { return whyLive(g, router) }, Usage: usage, Mode: mode})
+		check(err)
+		defer srv.Close()
 		defer func() { // after the story, before the router stops; not after an error
 			if r := recover(); r != nil {
 				panic(r)
 			}
-			check(serve.Run(*serveAddr, router, serve.Info{Why: func() string { return whyLive(g, router) }, Usage: usage, Mode: mode}))
+			check(srv.Ready())
 		}()
 	}
 
-	head := func(s string) { fmt.Printf("\n━━━ %s\n", s) }
+	head := func(s string) {
+		fmt.Printf("\n━━━ %s\n", s)
+		telemetry.Emit("story.step", telemetry.F{"demo": "incidents", "step": s})
+	}
 	say := func(turns []factory.Turn) {
 		for _, t := range turns {
 			fmt.Printf("   %s: %s\n", t.Who, t.Says)

@@ -4,7 +4,7 @@
 // (policy, synth); specs are parsed strictly and checked (factory.Capture);
 // code is compiled and run as a separate process, and only released after
 // its behaviour is checked (factory.ModelCoder). Run that last one in a
-// container: see docs/KIND.md.
+// container: see docs/USER-GUIDE.md.
 package model
 
 import (
@@ -20,6 +20,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/PureMunky/reversible/telemetry"
 )
 
 // Completer turns a system prompt and a user prompt into a reply.
@@ -119,6 +121,12 @@ type response struct {
 	} `json:"error"`
 }
 
+var (
+	mCalls  = telemetry.Default.Counter("reversible_model_calls_total", "Model API calls by outcome: ok, retried (rate limit, overload or network; retried with backoff), error, truncated (hit max_tokens).", "model", "outcome")
+	mTokens = telemetry.Default.Counter("reversible_model_tokens_total", "Model tokens by direction (input, output).", "model", "direction")
+	mSecs   = telemetry.Default.Histogram("reversible_model_call_seconds", "Model call duration.", []float64{1, 5, 10, 30, 60, 120, 300, 600}, "model")
+)
+
 // ErrTruncated means the reply hit the token limit and is incomplete.
 var ErrTruncated = errors.New("anthropic: reply cut off at max_tokens; raise REVERSIBLE_MAX_TOKENS")
 
@@ -166,16 +174,30 @@ func (a *Anthropic) Complete(ctx context.Context, system, prompt string) (string
 		}
 		start := time.Now()
 		r, status, err := a.send(ctx, hc, base, body)
+		mSecs.Observe(time.Since(start).Seconds(), m)
 		if err != nil {
 			lastErr = err
 			if status == 0 || status == 429 || status >= 500 {
+				mCalls.Inc(m, "retried")
+				telemetry.Emit("model.call", telemetry.F{"model": m, "outcome": "retried", "status": status, "error": err.Error(), "attempt": attempt + 1})
 				if a.Log != nil {
 					a.Log(fmt.Sprintf("model %s: %v (retrying)", m, err))
 				}
 				continue
 			}
+			mCalls.Inc(m, "error")
+			telemetry.Emit("model.call", telemetry.F{"model": m, "outcome": "error", "status": status, "error": err.Error()})
 			return "", err
 		}
+		mTokens.Add(float64(r.Usage.InputTokens), m, "input")
+		mTokens.Add(float64(r.Usage.OutputTokens), m, "output")
+		outcome := "ok"
+		if r.StopReason == "max_tokens" {
+			outcome = "truncated"
+		}
+		mCalls.Inc(m, outcome)
+		telemetry.Emit("model.call", telemetry.F{"model": m, "outcome": outcome, "input_tokens": r.Usage.InputTokens, "output_tokens": r.Usage.OutputTokens,
+			"seconds": time.Since(start).Seconds(), "stop_reason": r.StopReason})
 		a.mu.Lock()
 		a.usage.Calls++
 		a.usage.InputTokens += r.Usage.InputTokens

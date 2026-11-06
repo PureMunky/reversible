@@ -8,7 +8,7 @@
 #   live       DNS, and HTTPS (443) to public addresses only: not the
 #              cluster, the node, or your private networks
 # NetworkPolicy can't restrict by hostname, so live is "public 443", not
-# "api.anthropic.com only". See docs/KIND.md.
+# "api.anthropic.com only". See docs/ARCHITECTURE.md.
 apiVersion: v1
 kind: Namespace
 metadata:

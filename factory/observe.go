@@ -3,6 +3,7 @@ package factory
 import (
 	"context"
 	"fmt"
+	"github.com/PureMunky/reversible/telemetry"
 	"os"
 	"path/filepath"
 	"sort"
@@ -147,6 +148,16 @@ func Observe(ctx context.Context, r *Router) ([]Finding, error) {
 		out = append(out, *groups[k])
 	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Count > out[j].Count })
+	for _, f := range out {
+		caller := f.Caller
+		if caller == "" {
+			caller = "anonymous"
+		}
+		mFindings.Inc(live.Spec.Service, strings.ReplaceAll(string(f.Kind), " ", "_"), caller)
+		tel.Emit("finding", telemetry.F{"service": live.Spec.Service, "since": telemetry.Short(f.Since), "kind": string(f.Kind), "caller": caller,
+			"requests": f.Count, "because": f.Because, "summary": f.String()})
+	}
+	tel.Emit("observe.finished", telemetry.F{"service": live.Spec.Service, "version": telemetry.Short(live.SpecHash), "findings": len(out)})
 	return out, nil
 }
 

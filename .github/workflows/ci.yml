@@ -103,9 +103,10 @@ jobs:
           shellcheck deploy/kind/run.sh
           curl -sSL https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz | tar -xz -C "$RUNNER_TEMP"
           d="$RUNNER_TEMP/rendered"; mkdir -p "$d"
-          sed -e s/__NAME__/x/ -e s/__MODE__/live/ -e s/__NETWORK__/live/ -e s/__DEMO__/incidents/ -e s/__ENVKIND__/secretRef/ -e s/__ENVNAME__/anthropic/ -e s/__MODEL__// deploy/kind/manifests/demo-job.yaml > "$d/job.yaml"
+          sed -e s/__NAME__/x/ -e s/__MODE__/live/ -e s/__NETWORK__/live/ -e s/__DEMO__/incidents/ -e s/__ENVKIND__/secretRef/ -e s/__ENVNAME__/anthropic/ -e s/__MODEL__// -e s/__MAXTOKENS__// deploy/kind/manifests/demo-job.yaml > "$d/job.yaml"
           sed s/__NETWORK__/none/ deploy/kind/manifests/isolation-check.yaml > "$d/iso.yaml"
-          cp deploy/kind/manifests/base.yaml deploy/kind/manifests/fakeclaude.yaml "$d/"
+          cp deploy/kind/manifests/base.yaml deploy/kind/manifests/fakeclaude.yaml deploy/kind/manifests/observe.yaml "$d/"
+          python3 -c "import json; json.load(open('deploy/kind/observe/dashboard.json'))"
           "$RUNNER_TEMP/kubeconform" -strict -summary "$d"/*.yaml
       - name: install kind
         run: |
@@ -115,6 +116,8 @@ jobs:
         run: deploy/kind/run.sh up
       - name: network rules are enforced
         run: deploy/kind/run.sh check | tee check.txt && grep -q "Network rules enforced" check.txt
+      - name: observability
+        run: deploy/kind/run.sh observe
       - name: offline run, then use and inspect it
         run: |
           deploy/kind/run.sh offline | tee offline.txt
@@ -128,7 +131,23 @@ jobs:
           curl -sf 'localhost:8080/incidents?status=resolved' | grep -q inc-
           curl -s -X PATCH -H 'X-Caller: dashboards' -d '{"summary":"x"}' localhost:8080/incidents/inc-106 | grep -q "may not change incidents"
           curl -sf localhost:8080/_factory/why | grep -q "answers to production's questions"
+          curl -sf localhost:8080/metrics | tee metrics.txt | grep -q 'reversible_builds_total{service="incidents",outcome="passed"} 3'
+          grep -q 'reversible_live_version{service="incidents",version="11ddf7968e63"} 1' metrics.txt
+          curl -sf 'localhost:8080/_factory/events?kind=canary.promoted' | grep -q '"result":"promoted"'
+          curl -sf 'localhost:8080/_factory/events?kind=finding' | grep -q 'status-page-bot'
+          curl -sf localhost:8080/_factory/live | grep -q "EventSource"
           kill $pf
+      - name: Prometheus scraped the run; Grafana has the dashboard
+        run: |
+          deploy/kind/run.sh dashboards > dash.txt 2>&1 &
+          dash=$!
+          for i in $(seq 1 30); do curl -sf localhost:9090/-/ready >/dev/null && curl -sf localhost:3000/api/health >/dev/null && break; sleep 2; done
+          for i in $(seq 1 30); do
+            curl -sf 'localhost:9090/api/v1/query?query=sum(reversible_builds_total)' | tee q.txt | grep -q '"3"' && break; sleep 2
+          done
+          cat q.txt; grep -q '"3"' q.txt
+          curl -sf 'localhost:3000/api/search?query=Software%20built%20from%20intent' | grep -q '"uid":"reversible"'
+          kill $dash 2>/dev/null || true
       - name: rehearsal of the live path
         run: |
           deploy/kind/run.sh rehearse | tee rehearse.txt
@@ -140,5 +159,7 @@ jobs:
         if: failure()
         run: |
           kubectl --context kind-reversible -n reversible get all,networkpolicy || true
+          kubectl --context kind-reversible -n observe get all || true
+          kubectl --context kind-reversible -n observe logs --tail=50 deploy/grafana || true
           kubectl --context kind-reversible -n reversible describe pods || true
           kubectl --context kind-reversible -n reversible logs --tail=200 -l app.kubernetes.io/name=reversible-demo || true

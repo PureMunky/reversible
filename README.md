@@ -19,6 +19,8 @@ go run ./cmd/factory -show-prompts          # every prompt a model would be sent
 go run ./cmd/factory -keep                  # keep the generated code and data to read afterwards
 ```
 
+To run it in a local kind cluster, offline, rehearsed or with a real key, and watch it through metrics, an event stream and a Grafana dashboard: [docs/USER-GUIDE.md](docs/USER-GUIDE.md) (`deploy/kind/run.sh up`). How it all fits together when it runs: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
 Before running with a real key, read [docs/RUNNING-WITH-CLAUDE.md](docs/RUNNING-WITH-CLAUDE.md): what the model does, what leaves your machine, what runs on it (model-written code is executed, so use a container), and a step-by-step ladder from no risk to a live run.
 
 A real service built, changed, released and rewound from conversation. Nobody writes or edits code.

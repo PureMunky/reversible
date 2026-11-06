@@ -8,11 +8,14 @@
 #   deploy/kind/run.sh key               # store your Anthropic key in a Secret (input hidden)
 #   deploy/kind/run.sh live [demo]       # Claude writes the code (incidents) or the spec and code (factory)
 #   deploy/kind/run.sh open              # port-forward the running demo to localhost:8080
+#   deploy/kind/run.sh observe           # add Prometheus and Grafana, scraping the demo's telemetry
+#   deploy/kind/run.sh dashboards        # port-forward Grafana (localhost:3000) and Prometheus (:9090)
 #   deploy/kind/run.sh logs | status | forget-key | down
 #
 # demo is incidents (default) or factory. Set REVERSIBLE_MODEL to choose a
-# model for live runs, LOCAL_PORT for open, YES=1 to skip the live prompt.
-# docs/KIND.md walks through it.
+# model for live runs (REVERSIBLE_MAX_TOKENS for longer replies), LOCAL_PORT
+# for open, YES=1 to skip the live prompt.
+# docs/USER-GUIDE.md walks through it.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -79,7 +82,7 @@ run_demo() {
   case "$demo" in incidents|factory) ;; *) echo "demo is incidents or factory" >&2; exit 1 ;; esac
   k delete job -l app.kubernetes.io/name=reversible-demo --ignore-not-found --wait >/dev/null
   sed -e "s/__NAME__/$name/g" -e "s/__MODE__/$mode/g" -e "s/__NETWORK__/$net/g" -e "s/__DEMO__/$demo/g" \
-      -e "s/__ENVKIND__/$envkind/g" -e "s/__ENVNAME__/$envname/g" -e "s/__MODEL__/${REVERSIBLE_MODEL:-}/g" \
+      -e "s/__ENVKIND__/$envkind/g" -e "s/__ENVNAME__/$envname/g" -e "s/__MODEL__/${REVERSIBLE_MODEL:-}/g" -e "s/__MAXTOKENS__/${REVERSIBLE_MAX_TOKENS:-}/g" \
       "$here/manifests/demo-job.yaml" | kubectl --context "$ctx" apply -f - >/dev/null
   echo "── job/$name: $demo, $mode"
   # Wait for the container to start, stream its story, and stop streaming
@@ -90,9 +93,12 @@ run_demo() {
     [ -n "$phase" ] && [ "$phase" != Pending ] && break
     sleep 1
   done
-  k logs -f "job/$name" &
+  # kubectl itself in the background (not through k, a function: $! would
+  # be a subshell, and killing it would leave kubectl holding the output open).
+  kubectl --context "$ctx" -n "$ns" logs -f "job/$name" &
   local logs=$!
-  while true; do
+  local deadline=$((SECONDS + ${STORY_TIMEOUT:-2700}))
+  while [ $SECONDS -lt $deadline ]; do
     phase=$(k get pod -l job-name="$name" -o jsonpath='{.items[0].status.phase}')
     ready=$(k get pod -l job-name="$name" -o jsonpath='{.items[0].status.conditions[?(@.type=="Ready")].status}')
     [ "$ready" = True ] && break
@@ -108,7 +114,7 @@ run_demo() {
     echo "   http://localhost:${LOCAL_PORT:-8080}/_factory/   what's live and why; spec, examples, decisions, code"
     echo "   curl -s localhost:${LOCAL_PORT:-8080}/incidents?status=open     (use it; requests are recorded as production traffic)"
   else
-    echo "── job/$name ended ($phase) before serving; the story above says why."
+    echo "── job/$name ended ($phase) or timed out before serving; the story above says why (k get pods for more)."
     return 1
   fi
 }
@@ -158,7 +164,28 @@ live() {
 
 open_() {
   echo "http://localhost:${LOCAL_PORT:-8080}/_factory/  (Ctrl-C to stop forwarding)"
-  k port-forward svc/demo "${LOCAL_PORT:-8080}:8080"
+  exec kubectl --context "$ctx" -n "$ns" port-forward svc/demo "${LOCAL_PORT:-8080}:8080"
+}
+
+observe() {
+  echo "── Prometheus and Grafana in namespace observe (scraping the demo's /metrics)"
+  kubectl --context "$ctx" apply -f "$here/manifests/observe.yaml" >/dev/null
+  kubectl --context "$ctx" -n observe create configmap grafana-dashboard --from-file=dashboard.json="$here/observe/dashboard.json" \
+    --dry-run=client -o yaml | kubectl --context "$ctx" apply -f - >/dev/null
+  kubectl --context "$ctx" -n observe rollout restart deployment/grafana >/dev/null
+  kubectl --context "$ctx" -n observe rollout status deployment/prometheus --timeout=300s
+  kubectl --context "$ctx" -n observe rollout status deployment/grafana --timeout=300s
+  echo "Ready. $0 dashboards, then http://localhost:3000 (the dashboard is the home page)"
+}
+
+dashboards() {
+  echo "Grafana http://localhost:3000   Prometheus http://localhost:9090   (Ctrl-C to stop forwarding)"
+  kubectl --context "$ctx" -n observe port-forward svc/grafana 3000:3000 &
+  local g=$!
+  kubectl --context "$ctx" -n observe port-forward svc/prometheus 9090:9090 &
+  local p=$!
+  trap 'kill $g $p 2>/dev/null' EXIT INT TERM
+  wait
 }
 
 logs() { k logs --tail=-1 -l app.kubernetes.io/name=reversible-demo; }
@@ -183,9 +210,11 @@ case "$cmd" in
   key) key ;;
   live) live "$@" ;;
   open) open_ ;;
+  observe) observe ;;
+  dashboards) dashboards ;;
   logs) logs ;;
   status) status ;;
   forget-key) forget_key ;;
   down) down ;;
-  *) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+  *) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac

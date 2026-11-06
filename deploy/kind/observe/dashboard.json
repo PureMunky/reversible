@@ -1,0 +1,995 @@
+{
+ "uid": "reversible",
+ "title": "Software built from intent",
+ "description": "The path from intent to production for whatever the factory is running: what's live, how it was built and reviewed, what production says about it, and what the model cost.",
+ "tags": [
+  "reversible"
+ ],
+ "timezone": "browser",
+ "schemaVersion": 39,
+ "version": 1,
+ "refresh": "5s",
+ "time": {
+  "from": "now-30m",
+  "to": "now"
+ },
+ "panels": [
+  {
+   "type": "row",
+   "title": "What's live",
+   "id": 1,
+   "collapsed": false,
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 0
+   },
+   "panels": []
+  },
+  {
+   "type": "stat",
+   "title": "Live version",
+   "description": "The version serving production. Versions are named by the hash of the intent they were built from.",
+   "id": 2,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 6,
+    "x": 0,
+    "y": 1
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "max by (version) (reversible_live_version == 1)",
+     "legendFormat": "{{version}}",
+     "instant": true
+    }
+   ],
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "name",
+    "colorMode": "none",
+    "graphMode": "none",
+    "justifyMode": "auto",
+    "orientation": "auto"
+   },
+   "fieldConfig": {
+    "defaults": {
+     "noValue": "none",
+     "unit": "none"
+    },
+    "overrides": []
+   }
+  },
+  {
+   "type": "stat",
+   "title": "Canary",
+   "description": "A version running beside the live one on a share of real traffic, until evidence promotes or stops it.",
+   "id": 3,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 6,
+    "x": 6,
+    "y": 1
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "max by (version) (reversible_canary_version == 1)",
+     "legendFormat": "{{version}}",
+     "instant": true
+    }
+   ],
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "name",
+    "colorMode": "none",
+    "graphMode": "none",
+    "justifyMode": "auto",
+    "orientation": "auto"
+   },
+   "fieldConfig": {
+    "defaults": {
+     "noValue": "none",
+     "unit": "none"
+    },
+    "overrides": []
+   }
+  },
+  {
+   "type": "stat",
+   "title": "Releases",
+   "description": "Changes to what's live: release, canary_started, promote, canary_ended, rollback (a rewound decision put an earlier version back).",
+   "id": 4,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 12,
+    "x": 12,
+    "y": 1
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum by (action) (reversible_releases_total)",
+     "legendFormat": "{{action}}",
+     "instant": true
+    }
+   ],
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "value_and_name",
+    "colorMode": "none",
+    "graphMode": "none",
+    "justifyMode": "auto",
+    "orientation": "auto"
+   },
+   "fieldConfig": {
+    "defaults": {
+     "noValue": "0",
+     "unit": "none"
+    },
+    "overrides": []
+   }
+  },
+  {
+   "type": "timeseries",
+   "title": "Requests/s by version",
+   "description": "Production traffic, attributed to the version that served it. During a canary both versions serve the same data.",
+   "id": 5,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 5
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum by (version, role) (rate(reversible_requests_total[30s]))",
+     "legendFormat": "{{version}} ({{role}})"
+    }
+   ],
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "reqps",
+     "custom": {
+      "lineWidth": 2,
+      "fillOpacity": 8,
+      "showPoints": "never"
+     }
+    },
+    "overrides": []
+   }
+  },
+  {
+   "type": "timeseries",
+   "title": "Server error ratio by version",
+   "description": "What the canary's guardrail judges: a candidate whose errors rise above the live version's is stopped and rewound.",
+   "id": 6,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 12,
+    "y": 5
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "(sum by (version) (rate(reversible_requests_total{code=~\"5..\"}[1m])) / sum by (version) (rate(reversible_requests_total[1m]))) or (0 * sum by (version) (rate(reversible_requests_total[1m])))",
+     "legendFormat": "{{version}}"
+    }
+   ],
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "percentunit",
+     "custom": {
+      "lineWidth": 2,
+      "fillOpacity": 8,
+      "showPoints": "never"
+     }
+    },
+    "overrides": []
+   }
+  },
+  {
+   "type": "timeseries",
+   "title": "p95 latency by version",
+   "description": "",
+   "id": 7,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 13
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "histogram_quantile(0.95, sum by (le, version) (rate(reversible_request_seconds_bucket[1m])))",
+     "legendFormat": "{{version}}"
+    }
+   ],
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "custom": {
+      "lineWidth": 2,
+      "fillOpacity": 8,
+      "showPoints": "never"
+     }
+    },
+    "overrides": []
+   }
+  },
+  {
+   "type": "timeseries",
+   "title": "Refusals/s by status",
+   "description": "Requests the intent refuses: 400 field rules and references, 403 writers, 404, 409 rules and lifecycles. A new refusal after a release becomes a finding.",
+   "id": 8,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 12,
+    "y": 13
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum by (code, version) (rate(reversible_requests_total{code=~\"4..\"}[1m]))",
+     "legendFormat": "{{code}} {{version}}"
+    }
+   ],
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "reqps",
+     "custom": {
+      "lineWidth": 2,
+      "fillOpacity": 8,
+      "showPoints": "never"
+     }
+    },
+    "overrides": []
+   }
+  },
+  {
+   "type": "row",
+   "title": "Building from intent",
+   "id": 9,
+   "collapsed": false,
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 21
+   },
+   "panels": []
+  },
+  {
+   "type": "stat",
+   "title": "Builds",
+   "description": "passed, failed (no attempt passed its examples), cached (intent unchanged), blocked (the spec had blocking questions).",
+   "id": 10,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 6,
+    "x": 0,
+    "y": 22
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum by (outcome) (reversible_builds_total)",
+     "legendFormat": "{{outcome}}",
+     "instant": true
+    }
+   ],
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "value_and_name",
+    "colorMode": "none",
+    "graphMode": "none",
+    "justifyMode": "auto",
+    "orientation": "auto"
+   },
+   "fieldConfig": {
+    "defaults": {
+     "noValue": "0",
+     "unit": "none"
+    },
+    "overrides": []
+   }
+  },
+  {
+   "type": "stat",
+   "title": "Coding attempts",
+   "description": "Each attempt by the coder (a model, or the deterministic generator offline). A failed attempt is repaired from the exact failures.",
+   "id": 11,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 6,
+    "x": 6,
+    "y": 22
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum by (result) (reversible_build_attempts_total)",
+     "legendFormat": "{{result}}",
+     "instant": true
+    }
+   ],
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "value_and_name",
+    "colorMode": "none",
+    "graphMode": "none",
+    "justifyMode": "auto",
+    "orientation": "auto"
+   },
+   "fieldConfig": {
+    "defaults": {
+     "noValue": "0",
+     "unit": "none"
+    },
+    "overrides": []
+   }
+  },
+  {
+   "type": "stat",
+   "title": "Examples run",
+   "description": "The spec's examples are the contract; every build runs all of them.",
+   "id": 12,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 6,
+    "x": 12,
+    "y": 22
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum by (result) (reversible_examples_total)",
+     "legendFormat": "{{result}}",
+     "instant": true
+    }
+   ],
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "value_and_name",
+    "colorMode": "none",
+    "graphMode": "none",
+    "justifyMode": "auto",
+    "orientation": "auto"
+   },
+   "fieldConfig": {
+    "defaults": {
+     "noValue": "0",
+     "unit": "none"
+    },
+    "overrides": []
+   }
+  },
+  {
+   "type": "stat",
+   "title": "Generated lines, live version",
+   "description": "Code is a cache: generated, never edited.",
+   "id": 13,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 6,
+    "x": 18,
+    "y": 22
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "max(reversible_generated_lines * on (version) group_left max by (version) (reversible_live_version == 1))",
+     "legendFormat": "lines",
+     "instant": true
+    }
+   ],
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "value",
+    "colorMode": "none",
+    "graphMode": "none",
+    "justifyMode": "auto",
+    "orientation": "auto"
+   },
+   "fieldConfig": {
+    "defaults": {
+     "noValue": "0",
+     "unit": "none"
+    },
+    "overrides": []
+   }
+  },
+  {
+   "type": "stat",
+   "title": "Review: behaviour changes",
+   "description": "Differences found by replaying traffic and reading existing data through both versions. explained: no blocks sign-off.",
+   "id": 14,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 8,
+    "x": 0,
+    "y": 26
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum by (explained) (reversible_review_changes_total)",
+     "legendFormat": "explained: {{explained}}",
+     "instant": true
+    }
+   ],
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "value_and_name",
+    "colorMode": "none",
+    "graphMode": "none",
+    "justifyMode": "auto",
+    "orientation": "auto"
+   },
+   "fieldConfig": {
+    "defaults": {
+     "noValue": "0",
+     "unit": "none"
+    },
+    "overrides": []
+   }
+  },
+  {
+   "type": "stat",
+   "title": "Reviews",
+   "description": "",
+   "id": 15,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 8,
+    "x": 8,
+    "y": 26
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum by (outcome) (reversible_reviews_total)",
+     "legendFormat": "{{outcome}}",
+     "instant": true
+    }
+   ],
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "value_and_name",
+    "colorMode": "none",
+    "graphMode": "none",
+    "justifyMode": "auto",
+    "orientation": "auto"
+   },
+   "fieldConfig": {
+    "defaults": {
+     "noValue": "0",
+     "unit": "none"
+    },
+    "overrides": []
+   }
+  },
+  {
+   "type": "stat",
+   "title": "Canary evaluations",
+   "description": "",
+   "id": 16,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 8,
+    "x": 16,
+    "y": 26
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum by (result) (reversible_canary_evaluations_total)",
+     "legendFormat": "{{result}}",
+     "instant": true
+    }
+   ],
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "value_and_name",
+    "colorMode": "none",
+    "graphMode": "none",
+    "justifyMode": "auto",
+    "orientation": "auto"
+   },
+   "fieldConfig": {
+    "defaults": {
+     "noValue": "0",
+     "unit": "none"
+    },
+    "overrides": []
+   }
+  },
+  {
+   "type": "stat",
+   "title": "Findings from production",
+   "description": "Requests a new version refused or failed that the previous one served. Each becomes a question for the owner whose answer is new intent.",
+   "id": 17,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "h": 5,
+    "w": 12,
+    "x": 0,
+    "y": 30
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum by (kind, caller) (reversible_findings_total)",
+     "legendFormat": "{{kind}}: {{caller}}",
+     "instant": true
+    }
+   ],
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "value_and_name",
+    "colorMode": "none",
+    "graphMode": "none",
+    "justifyMode": "auto",
+    "orientation": "auto"
+   },
+   "fieldConfig": {
+    "defaults": {
+     "noValue": "none",
+     "unit": "none"
+    },
+    "overrides": []
+   }
+  },
+  {
+   "type": "stat",
+   "title": "Decision ledger",
+   "description": "Signed, hash-chained history: goals, decisions, outcomes, executions, rewinds.",
+   "id": 18,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "h": 5,
+    "w": 12,
+    "x": 12,
+    "y": 30
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum by (type) (reversible_ledger_records_total)",
+     "legendFormat": "{{type}}",
+     "instant": true
+    }
+   ],
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "value_and_name",
+    "colorMode": "none",
+    "graphMode": "none",
+    "justifyMode": "auto",
+    "orientation": "auto"
+   },
+   "fieldConfig": {
+    "defaults": {
+     "noValue": "0",
+     "unit": "none"
+    },
+    "overrides": []
+   }
+  },
+  {
+   "type": "row",
+   "title": "Model",
+   "id": 19,
+   "collapsed": false,
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 35
+   },
+   "panels": []
+  },
+  {
+   "type": "stat",
+   "title": "Model calls",
+   "description": "ok, retried (rate limit, overload or network), error, truncated (hit max_tokens). Offline runs make none.",
+   "id": 20,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 8,
+    "x": 0,
+    "y": 36
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum by (outcome) (reversible_model_calls_total)",
+     "legendFormat": "{{outcome}}",
+     "instant": true
+    }
+   ],
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "value_and_name",
+    "colorMode": "none",
+    "graphMode": "none",
+    "justifyMode": "auto",
+    "orientation": "auto"
+   },
+   "fieldConfig": {
+    "defaults": {
+     "noValue": "none",
+     "unit": "none"
+    },
+    "overrides": []
+   }
+  },
+  {
+   "type": "stat",
+   "title": "Model tokens",
+   "description": "",
+   "id": 21,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 8,
+    "x": 8,
+    "y": 36
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum by (direction) (reversible_model_tokens_total)",
+     "legendFormat": "{{direction}}",
+     "instant": true
+    }
+   ],
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "value_and_name",
+    "colorMode": "none",
+    "graphMode": "none",
+    "justifyMode": "auto",
+    "orientation": "auto"
+   },
+   "fieldConfig": {
+    "defaults": {
+     "noValue": "none",
+     "unit": "none"
+    },
+    "overrides": []
+   }
+  },
+  {
+   "type": "timeseries",
+   "title": "Model call p95 seconds",
+   "description": "",
+   "id": 22,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 8,
+    "x": 16,
+    "y": 36
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "histogram_quantile(0.95, sum by (le, model) (rate(reversible_model_call_seconds_bucket[5m])))",
+     "legendFormat": "{{model}}"
+    }
+   ],
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "custom": {
+      "lineWidth": 2,
+      "fillOpacity": 8,
+      "showPoints": "never"
+     }
+    },
+    "overrides": []
+   }
+  }
+ ],
+ "templating": {
+  "list": []
+ },
+ "annotations": {
+  "list": []
+ },
+ "editable": true
+}

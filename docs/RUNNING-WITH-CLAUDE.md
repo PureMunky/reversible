@@ -30,7 +30,7 @@ This is the part to understand before running the factory live.
 
 - **Model-written Go is compiled and executed** (`factory/build.go`): written to a temporary directory, built with `go build` (standard library only, `CGO_ENABLED=0`, no module downloads), and run as its own process listening on `127.0.0.1` on a random port.
 - **It runs with your user's permissions.** The gate checks *behaviour*: it runs the examples against the process and compares responses. It does not inspect what the code does besides answering requests. A generated program could read files or open network connections, and the examples would never notice.
-- **So run the factory live in a container or VM**, not on your workstation directly. For example:
+- **So run the factory live in a container or VM**, not on your workstation directly. The kind environment does this for you, with the key in a Secret, no cluster credentials, a read-only root and limited egress, and a free rehearsal of the whole path first: see [USER-GUIDE.md](USER-GUIDE.md) and, for what it does and doesn't contain, [ARCHITECTURE.md](ARCHITECTURE.md#trust-boundaries). Or, with plain Docker:
 
   ```sh
   docker run --rm -it -v "$PWD":/src -w /src \
@@ -77,7 +77,7 @@ The designer demo (`cmd/designer`) never executes model output: policies are dat
 ## Choosing a model, and cost
 
 - The default model is `claude-sonnet-5-5`. Override with `REVERSIBLE_MODEL`, for example `REVERSIBLE_MODEL=claude-opus-5-5`.
-- A full factory run makes roughly 5 to 12 calls: about two spec drafts, then one to three coding attempts for each of three builds. Each call sends a few thousand tokens and gets back up to a few thousand. Check current pricing on Anthropic's site rather than trusting an estimate here.
+- A full factory run makes roughly 5 to 12 calls: about two spec drafts, then one to three coding attempts for each of three builds; the incident tracker makes 3 to 9 (coding only). Each coding call sends a few thousand tokens and gets back several thousand (the whole service, up to `REVERSIBLE_MAX_TOKENS`, default 16000). Every call's tokens are logged and counted in `reversible_model_tokens_total`. Check current pricing on Anthropic's site rather than trusting an estimate here.
 - Keys are read only from the environment (`model.FromEnv`). Don't put one in a file in this repo.
 
 ## Known gaps in the live path

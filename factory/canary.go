@@ -9,6 +9,7 @@ import (
 	"github.com/PureMunky/reversible/counterfactual"
 	"github.com/PureMunky/reversible/decision"
 	"github.com/PureMunky/reversible/evolve"
+	"github.com/PureMunky/reversible/telemetry"
 )
 
 // Review is everything checked before a candidate may touch production:
@@ -61,7 +62,43 @@ func ReviewCandidate(ctx context.Context, router *Router, candidate *Version) (R
 	if r.Mixed, err = MixedCheck(ctx, live, candidate); err != nil {
 		return r, err
 	}
+	r.publish(live, candidate)
 	return r, nil
+}
+
+// publish reports a review: how many differences each check found, how
+// many the intent explains, and why (grouped), so an observer sees what a
+// release would change without reading the diff.
+func (r Review) publish(live, candidate *Version) {
+	svc := candidate.Spec.Service
+	because := map[string]int{}
+	count := func(check string, d BehaviourDiff) (int, int) {
+		unexplained := 0
+		for _, c := range d.Changes {
+			if c.Because == "" {
+				unexplained++
+				continue
+			}
+			because[c.Because]++
+		}
+		mChanges.Add(float64(len(d.Changes)-unexplained), svc, check, "yes")
+		mChanges.Add(float64(unexplained), svc, check, "no")
+		return len(d.Changes), unexplained
+	}
+	rc, ru := count("replay", r.Replay)
+	sc, su := count("existing_data", r.State)
+	outcome := "clean"
+	if !r.Clean() {
+		outcome = "blocked"
+	}
+	mReviews.Inc(svc, outcome)
+	f := telemetry.F{"service": svc, "live": telemetry.Short(live.SpecHash), "candidate": telemetry.Short(candidate.SpecHash),
+		"outcome": outcome, "replayed": r.Replay.Replayed, "replay_changes": rc, "replay_unexplained": ru,
+		"existing_data_changes": sc, "existing_data_unexplained": su, "mixed_version_problems": len(r.Mixed), "explained_by": because}
+	if len(r.Mixed) > 0 {
+		f["mixed"] = r.Mixed
+	}
+	tel.Emit("review.finished", f)
 }
 
 // CanaryOptions shape a canary release.
@@ -174,6 +211,7 @@ func (c *Canary) Evaluate(ctx context.Context) (CanaryResult, error) {
 	if err != nil {
 		return res, err
 	}
+	defer func() { c.publish(res) }()
 	switch {
 	case v.Promoted == c.Candidate.SpecHash:
 		in := reversible.Intent{ID: "promote-" + c.Candidate.SpecHash, Goal: "promote canary " + c.Candidate.SpecHash,
@@ -211,6 +249,30 @@ func indentLines(s, prefix string) string {
 		lines[i] = prefix + l
 	}
 	return strings.Join(lines, "\n") + "\n"
+}
+
+func (c *Canary) publish(res CanaryResult) {
+	result := "running"
+	switch {
+	case res.Promoted:
+		result = "promoted"
+	case res.Stopped:
+		result = "stopped"
+	}
+	svc := c.Candidate.Spec.Service
+	mCanaryEval.Inc(svc, result)
+	f := telemetry.F{"service": svc, "candidate": telemetry.Short(c.Candidate.SpecHash), "decision": c.decision, "result": result, "summary": res.String()}
+	if res.Verdict.Samples > 0 {
+		f["samples"] = res.Verdict.Samples
+	}
+	for _, r := range res.Verdict.Retired {
+		f["reason"] = r.Reason
+	}
+	kind := "canary.evaluated"
+	if result != "running" {
+		kind = "canary." + result
+	}
+	tel.Emit(kind, f)
 }
 
 // String summarises a canary result.
