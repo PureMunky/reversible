@@ -81,7 +81,7 @@ sequenceDiagram
     end
     R->>F: traffic since release
     F->>F: Observe: replay through V1 from the release snapshot
-    F-->>Owner: findings as questions; each answer is spec v3
+    F-->>Owner: findings as questions, each answer a new spec (v3)
 ```
 
 Three properties hold throughout:
@@ -104,7 +104,7 @@ flowchart TB
             S[[Secret anthropic<br/>live runs only]]
             CM[[ConfigMaps<br/>offline · rehearsal]]
             subgraph job[Job pod: the demo]
-                D[demo process<br/>factory · router :8080 · ledger · canary]
+                D[demo process<br/>factory · router · ledger · canary<br/>:8080 production · inspector · telemetry]
                 GB[go build]
                 G1[generated v1<br/>127.0.0.1:random]
                 G2[generated v2<br/>127.0.0.1:random]
