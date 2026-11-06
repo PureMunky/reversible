@@ -87,7 +87,7 @@ func (r *Router) Traffic() []Exchange {
 
 // ServeHTTP forwards a request to the live version and records it.
 func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	call := HTTPCall{Method: req.Method, Path: req.URL.Path, Caller: req.Header.Get("X-Caller")}
+	call := HTTPCall{Method: req.Method, Path: req.URL.RequestURI(), Caller: req.Header.Get("X-Caller")}
 	if raw, _ := io.ReadAll(io.LimitReader(req.Body, 1<<20)); len(raw) > 0 {
 		var body any
 		if json.Unmarshal(raw, &body) != nil {

@@ -1,0 +1,114 @@
+# The namespace the demos run in, and what may talk to what.
+#
+# Model-written code is compiled and run inside the demo pod, so the pod
+# gets the least the run needs: no Kubernetes API credentials, a read-only
+# root filesystem, no capabilities, and a network that depends on the mode:
+#   offline    no network at all
+#   rehearsal  only the fakeclaude stand-in, in this namespace
+#   live       DNS, and HTTPS (443) to public addresses only: not the
+#              cluster, the node, or your private networks
+# NetworkPolicy can't restrict by hostname, so live is "public 443", not
+# "api.anthropic.com only". See docs/KIND.md.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: reversible
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/warn: restricted
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: reversible
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: live-egress
+  namespace: reversible
+spec:
+  podSelector:
+    matchLabels:
+      reversible/network: live
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 100.64.0.0/10]
+      ports:
+        - {protocol: TCP, port: 443}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: rehearsal-egress
+  namespace: reversible
+spec:
+  podSelector:
+    matchLabels:
+      reversible/network: rehearsal
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: fakeclaude
+      ports:
+        - {protocol: TCP, port: 8080}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: fakeclaude-ingress
+  namespace: reversible
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: fakeclaude
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              reversible/network: rehearsal
+      ports:
+        - {protocol: TCP, port: 8080}
+---
+# Reached with `kubectl port-forward`, which doesn't pass through
+# NetworkPolicy; nothing in the cluster can reach the demo.
+apiVersion: v1
+kind: Service
+metadata:
+  name: demo
+  namespace: reversible
+spec:
+  selector:
+    app.kubernetes.io/name: reversible-demo
+  ports:
+    - {name: http, port: 8080, targetPort: 8080}

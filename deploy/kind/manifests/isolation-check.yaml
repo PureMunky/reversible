@@ -1,0 +1,45 @@
+# Proves the network rules are enforced on this cluster, rather than
+# assuming it: an offline pod must not reach anything (not even DNS), a
+# live pod must reach the Anthropic API but not the Kubernetes API.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: isolation-__NETWORK__
+  namespace: reversible
+  labels:
+    reversible/network: __NETWORK__
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  enableServiceLinks: false
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    runAsGroup: 65532
+    seccompProfile: {type: RuntimeDefault}
+  containers:
+    - name: check
+      image: reversible:dev
+      imagePullPolicy: Never
+      command: ["sh", "-c"] # reach: cmd/reach, a TCP connect check
+      args:
+        - |
+          k8s=kubernetes.default.svc.cluster.local:443
+          api=api.anthropic.com:443
+          case "__NETWORK__" in
+            none)
+              for a in $api $k8s example.com:443; do
+                if reach $a; then echo "FAIL: an offline pod reached $a"; exit 1; fi
+              done
+              echo "ok: an offline pod reaches nothing";;
+            live)
+              reach $api || { echo "FAIL: a live pod can't reach the Anthropic API"; exit 1; }
+              if reach $k8s; then echo "FAIL: a live pod reached the Kubernetes API"; exit 1; fi
+              echo "ok: a live pod reaches the Anthropic API, and not the cluster";;
+          esac
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities: {drop: [ALL]}
+      resources:
+        limits: {cpu: 200m, memory: 64Mi}

@@ -90,3 +90,55 @@ jobs:
           grep -q "recovered onboard-initech from a crash: rolled_back" out.txt
           ./agentctl -dir "$RUNNER_TEMP/st" world | grep -q "workspaces=\[ws-acme\]"
           grep -q "onboard-acme *pending" out.txt
+
+  # The kind environment end to end: the real image, the network rules
+  # proven enforced, an offline run and a rehearsal of the live path
+  # (cmd/fakeclaude stands in for the API; no key is used in CI).
+  kind:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: lint the environment
+        run: |
+          shellcheck deploy/kind/run.sh
+          curl -sSL https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz | tar -xz -C "$RUNNER_TEMP"
+          d="$RUNNER_TEMP/rendered"; mkdir -p "$d"
+          sed -e s/__NAME__/x/ -e s/__MODE__/live/ -e s/__NETWORK__/live/ -e s/__DEMO__/incidents/ -e s/__ENVKIND__/secretRef/ -e s/__ENVNAME__/anthropic/ -e s/__MODEL__// deploy/kind/manifests/demo-job.yaml > "$d/job.yaml"
+          sed s/__NETWORK__/none/ deploy/kind/manifests/isolation-check.yaml > "$d/iso.yaml"
+          cp deploy/kind/manifests/base.yaml deploy/kind/manifests/fakeclaude.yaml "$d/"
+          "$RUNNER_TEMP/kubeconform" -strict -summary "$d"/*.yaml
+      - name: install kind
+        run: |
+          curl -sSLo "$RUNNER_TEMP/kind" https://github.com/kubernetes-sigs/kind/releases/download/v0.27.0/kind-linux-amd64
+          chmod +x "$RUNNER_TEMP/kind" && sudo mv "$RUNNER_TEMP/kind" /usr/local/bin/kind
+      - name: up
+        run: deploy/kind/run.sh up
+      - name: network rules are enforced
+        run: deploy/kind/run.sh check | tee check.txt && grep -q "Network rules enforced" check.txt
+      - name: offline run, then use and inspect it
+        run: |
+          deploy/kind/run.sh offline | tee offline.txt
+          grep -q "27/27 examples pass" offline.txt
+          grep -q "It's serving" offline.txt
+          deploy/kind/run.sh open > pf.txt 2>&1 &
+          pf=$!
+          for i in $(seq 1 30); do curl -sf localhost:8080/_factory/ > inspect.txt && break; sleep 1; done
+          cat inspect.txt
+          grep -q "27/27 examples pass" inspect.txt
+          curl -sf 'localhost:8080/incidents?status=resolved' | grep -q inc-
+          curl -s -X PATCH -H 'X-Caller: dashboards' -d '{"summary":"x"}' localhost:8080/incidents/inc-106 | grep -q "may not change incidents"
+          curl -sf localhost:8080/_factory/why | grep -q "answers to production's questions"
+          kill $pf
+      - name: rehearsal of the live path
+        run: |
+          deploy/kind/run.sh rehearse | tee rehearse.txt
+          grep -q "mode: live" rehearse.txt
+          grep -q "overloaded_error: rehearsal: overloaded (retrying)" rehearse.txt
+          grep -q "27/27 examples pass" rehearse.txt
+          grep -q "It's serving" rehearse.txt
+      - name: diagnostics
+        if: failure()
+        run: |
+          kubectl --context kind-reversible -n reversible get all,networkpolicy || true
+          kubectl --context kind-reversible -n reversible describe pods || true
+          kubectl --context kind-reversible -n reversible logs --tail=200 -l app.kubernetes.io/name=reversible-demo || true

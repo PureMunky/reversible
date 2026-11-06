@@ -7,8 +7,16 @@
 // reference each other, records that move through a lifecycle, filters,
 // and who may change what, all stated as intent and all generated.
 //
-//	go run ./cmd/incidents         # offline: deterministic coder
-//	go run ./cmd/incidents -keep   # keep the generated code and data
+//	go run ./cmd/incidents                        # offline: deterministic coder
+//	ANTHROPIC_API_KEY=... go run ./cmd/incidents  # Claude writes the code for each version of the intent
+//	go run ./cmd/incidents -keep                  # keep the generated code and data
+//	go run ./cmd/incidents -serve :8080           # then keep production serving, with an inspector at /_factory/
+//
+// Live, the intent is still the hand-written spec (Priya's conversation is
+// shown, not captured): this run isolates the claim that a model can write
+// the software from intent, and that the review, not a person reading the
+// code, decides whether what it wrote is right. cmd/factory has Claude
+// draft the spec from conversation too.
 package main
 
 import (
@@ -23,8 +31,10 @@ import (
 	"strings"
 
 	"github.com/PureMunky/reversible"
+	"github.com/PureMunky/reversible/cmd/internal/serve"
 	"github.com/PureMunky/reversible/decision"
 	"github.com/PureMunky/reversible/factory"
+	"github.com/PureMunky/reversible/model"
 )
 
 //go:embed intent/*.json
@@ -43,6 +53,7 @@ var conversation2 = []factory.Turn{
 
 func main() {
 	keep := flag.Bool("keep", false, "keep the work directory (generated code, builds, production data)")
+	serveAddr := flag.String("serve", "", "after the story, keep production serving on this address (e.g. :8080) until stopped, with an inspector at /_factory/")
 	flag.Parse()
 	ctx := context.Background()
 	defer func() {
@@ -68,7 +79,17 @@ func main() {
 		defer os.RemoveAll(work)
 	}
 
-	fab := &factory.Factory{Root: filepath.Join(work, "builds"), Coder: factory.Codegen{}}
+	var coder factory.Coder = factory.Codegen{}
+	var usage func() string
+	mode := "offline: the spec is written alongside each conversation, and code is compiled from it by a deterministic generator (set ANTHROPIC_API_KEY for Claude to write the code)"
+	if a, ok := model.FromEnv(); ok {
+		a.Log = func(l string) { fmt.Println("   ·", l) }
+		coder = factory.ModelCoder{Model: a}
+		usage = func() string { return a.Usage().String() }
+		mode = "live: Claude writes every version of the code from the intent; the examples and the review decide whether it ships"
+		defer func() { fmt.Println("   model usage:", usage()) }()
+	}
+	fab := &factory.Factory{Root: filepath.Join(work, "builds"), Coder: coder}
 	keys := decision.NewKeyring()
 	for _, a := range []string{"priya", "factory"} {
 		_, err := keys.Generate(a)
@@ -85,6 +106,14 @@ func main() {
 	prod := httptest.NewServer(router)
 	defer prod.Close()
 	rt := reversible.New()
+	if *serveAddr != "" {
+		defer func() { // after the story, before the router stops; not after an error
+			if r := recover(); r != nil {
+				panic(r)
+			}
+			check(serve.Run(*serveAddr, router, serve.Info{Why: func() string { return whyLive(g, router) }, Usage: usage, Mode: mode}))
+		}()
+	}
 
 	head := func(s string) { fmt.Printf("\n━━━ %s\n", s) }
 	say := func(turns []factory.Turn) {
@@ -136,6 +165,7 @@ func main() {
 
 	fmt.Println("Software built from intent: an incident tracker. Nobody writes or edits code in this run.")
 	fmt.Println("The domain is an example: this is the same factory that builds the feature-flag service, with nothing incident-specific in it.")
+	fmt.Println("mode:", mode)
 
 	head("1 · Priya, the on-call lead, describes what she needs")
 	say(conversation1)
@@ -267,6 +297,20 @@ func main() {
 	}
 
 	finish(g, store, keys, generated, "described an incident tracker in two short conversations, signed off on behaviour three times, and answered two questions production raised (canaries and evidence decided the releases)")
+}
+
+// whyLive explains the live version from the ledger.
+func whyLive(g *decision.Graph, router *factory.Router) string {
+	live := router.Live()
+	if live == nil {
+		return ""
+	}
+	for _, id := range []string{"promote-" + live.SpecHash, "release-" + live.SpecHash} {
+		if why, err := g.ExplainIntent(id); err == nil {
+			return why
+		}
+	}
+	return ""
 }
 
 func finish(g *decision.Graph, store decision.Log, keys *decision.Keyring, generated int, did string) {

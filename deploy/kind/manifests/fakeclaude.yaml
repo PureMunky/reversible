@@ -1,0 +1,66 @@
+# The rehearsal stand-in for the Messages API (cmd/fakeclaude): answers
+# coding requests with the deterministic generator's code. No model, no
+# key, no cost; only rehearsal pods can reach it.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fakeclaude
+  namespace: reversible
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app.kubernetes.io/name: fakeclaude}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: fakeclaude}
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: fakeclaude
+          image: reversible:dev
+          imagePullPolicy: Never
+          args: ["fakeclaude", "-addr", ":8080", "-flaky", "1"]
+          ports:
+            - {name: http, containerPort: 8080}
+          readinessProbe:
+            httpGet: {path: /healthz, port: http}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {cpu: 500m, memory: 256Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fakeclaude
+  namespace: reversible
+spec:
+  selector: {app.kubernetes.io/name: fakeclaude}
+  ports:
+    - {name: http, port: 8080, targetPort: 8080}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rehearsal
+  namespace: reversible
+data:
+  ANTHROPIC_API_KEY: rehearsal-not-a-real-key
+  ANTHROPIC_BASE_URL: http://fakeclaude.reversible.svc.cluster.local:8080
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: offline
+  namespace: reversible
+data:
+  REVERSIBLE_MODE: offline

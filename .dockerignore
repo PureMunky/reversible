@@ -1,0 +1,7 @@
+.git
+.github
+.reversible
+agentctl
+*.txt
+deploy
+docs

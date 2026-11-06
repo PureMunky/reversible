@@ -2,6 +2,7 @@ package factory
 
 import (
 	"context"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
@@ -173,4 +174,38 @@ func blockingOf(s ServiceSpec) []Question {
 		}
 	}
 	return out
+}
+
+func TestRouterForwardsFilters(t *testing.T) {
+	ctx := context.Background()
+	v, err := (&Factory{Root: t.TempDir(), Coder: Codegen{}}).Build(ctx, incidentSpec(t, "1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	router := &Router{DataPath: t.TempDir() + "/data.json"}
+	defer router.Stop()
+	if _, err := router.Release(v).Do(ctx); err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(router)
+	defer srv.Close()
+	for _, c := range []HTTPCall{
+		{Method: "POST", Path: "/services", Body: map[string]any{"name": "a", "team": "t"}, Caller: "platform-team"},
+		{Method: "POST", Path: "/incidents", Body: map[string]any{"id": "inc-1", "service": "a", "severity": "sev1", "summary": "x"}},
+		{Method: "POST", Path: "/incidents", Body: map[string]any{"id": "inc-2", "service": "a", "severity": "sev2", "summary": "y"}},
+	} {
+		if r, err := Call(ctx, srv.URL, c); err != nil || r.Status != 201 {
+			t.Fatalf("%v: %v %v", c, r, err)
+		}
+	}
+	r, err := Call(ctx, srv.URL, HTTPCall{Method: "GET", Path: "/incidents?severity=sev2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := r.Body.([]any); len(got) != 1 {
+		t.Fatalf("filter through the router returned %v", r.Body)
+	}
+	if p := router.Traffic()[3].Request.Path; p != "/incidents?severity=sev2" {
+		t.Fatalf("recorded path %q: replay would lose the filter", p)
+	}
 }

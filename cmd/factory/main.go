@@ -7,6 +7,7 @@
 //	go run ./cmd/factory -brittle-coder         # a defect only real traffic shows: watch the canary stop it
 //	go run ./cmd/factory -show-prompts          # print every prompt a model would get, calling nothing
 //	go run ./cmd/factory -keep                  # keep the generated code and data to read afterwards
+//	go run ./cmd/factory -serve :8080           # then keep production serving, with an inspector at /_factory/
 package main
 
 import (
@@ -22,6 +23,7 @@ import (
 	"strings"
 
 	"github.com/PureMunky/reversible"
+	"github.com/PureMunky/reversible/cmd/internal/serve"
 	"github.com/PureMunky/reversible/decision"
 	"github.com/PureMunky/reversible/factory"
 	"github.com/PureMunky/reversible/model"
@@ -46,6 +48,7 @@ func main() {
 	showPrompts := flag.Bool("show-prompts", false, "print exactly what a model would be sent at each step, without calling one")
 	brittleCoder := flag.Bool("brittle-coder", false, "use a coder whose later builds fail on real traffic in a way no example or review shows: watch the canary stop it")
 	keep := flag.Bool("keep", false, "keep the work directory (generated code, builds, production data) and print where it is")
+	serveAddr := flag.String("serve", "", "after the story, keep production serving on this address (e.g. :8080) until stopped, with an inspector at /_factory/")
 	flag.Parse()
 	ctx := context.Background()
 	// Errors unwind through the deferred cleanup (stopping every generated
@@ -75,10 +78,14 @@ func main() {
 
 	var coder factory.Coder = factory.Codegen{}
 	var m model.Completer
+	var usage func() string
 	who := "offline: the spec is written alongside each conversation, and code is compiled from it by a deterministic generator (set ANTHROPIC_API_KEY for Claude to draft the spec and write the code)"
 	if a, ok := model.FromEnv(); ok {
+		a.Log = func(l string) { fmt.Println("   ·", l) }
 		m, coder = a, factory.ModelCoder{Model: a}
+		usage = func() string { return a.Usage().String() }
 		who = "Claude drafts the spec from the conversation and writes the code"
+		defer func() { fmt.Println("   model usage:", usage()) }()
 	}
 	var shower model.Completer
 	if *showPrompts && m == nil {
@@ -124,6 +131,16 @@ func main() {
 	prod := httptest.NewServer(router)
 	defer prod.Close()
 	rt := reversible.New()
+	if *serveAddr != "" {
+		// Runs after the story (deferred calls run last-registered first, so
+		// before the router stops); not after an error.
+		defer func() {
+			if r := recover(); r != nil {
+				panic(r)
+			}
+			check(serve.Run(*serveAddr, router, serve.Info{Why: func() string { return whyLive(g, router) }, Usage: usage, Mode: who}))
+		}()
+	}
 
 	head := func(s string) { fmt.Printf("\n━━━ %s\n", s) }
 	say := func(turns []factory.Turn) {
@@ -389,19 +406,25 @@ func finish(g *decision.Graph, store decision.Log, keys *decision.Keyring, gener
 		fmt.Print(", chain verifies ✓")
 	}
 	fmt.Println()
-	if live := router.Live(); live != nil {
-		var why string
-		var err error
-		for _, id := range []string{"release-" + live.SpecHash + "-again", "promote-" + live.SpecHash, "release-" + live.SpecHash} {
-			if why, err = g.ExplainIntent(id); err == nil {
-				break
-			}
-		}
-		if err == nil {
-			fmt.Println("\n   why is this version live?")
-			fmt.Print(indent(indent(why)))
+	if why := whyLive(g, router); why != "" {
+		fmt.Println("\n   why is this version live?")
+		fmt.Print(indent(indent(why)))
+	}
+}
+
+// whyLive explains the live version from the ledger: the release or
+// promotion that put it there, back to the conversation behind it.
+func whyLive(g *decision.Graph, router *factory.Router) string {
+	live := router.Live()
+	if live == nil {
+		return ""
+	}
+	for _, id := range []string{"release-" + live.SpecHash + "-again", "promote-" + live.SpecHash, "release-" + live.SpecHash} {
+		if why, err := g.ExplainIntent(id); err == nil {
+			return why
 		}
 	}
+	return ""
 }
 
 // teamWeek is a week of the platform team using the service.

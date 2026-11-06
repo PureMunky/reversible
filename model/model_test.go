@@ -3,11 +3,13 @@ package model
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestAnthropicRequestAndReply(t *testing.T) {
@@ -27,7 +29,7 @@ func TestAnthropicRequestAndReply(t *testing.T) {
 	if err != nil || out != "hello world" {
 		t.Fatalf("out=%q err=%v", out, err)
 	}
-	if got.Model != DefaultModel || got.System != "sys" || got.MaxTokens != 4096 || got.Messages[0].Content != "hi" {
+	if got.Model != DefaultModel || got.System != "sys" || got.MaxTokens != DefaultMaxTokens || got.Messages[0].Content != "hi" {
 		t.Fatalf("request body: %+v", got)
 	}
 }
@@ -38,12 +40,63 @@ func TestAnthropicErrors(t *testing.T) {
 		w.Write([]byte(`{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}`))
 	}))
 	defer srv.Close()
-	_, err := (&Anthropic{APIKey: "k", BaseURL: srv.URL}).Complete(context.Background(), "", "x")
+	_, err := (&Anthropic{APIKey: "k", BaseURL: srv.URL, Retries: -1}).Complete(context.Background(), "", "x")
 	if err == nil || !strings.Contains(err.Error(), "HTTP 429: rate_limit_error: slow down") {
 		t.Fatalf("err = %v", err)
 	}
 	if _, err := (&Anthropic{}).Complete(context.Background(), "", "x"); err == nil {
 		t.Fatal("expected error without a key")
+	}
+}
+
+func TestAnthropicRetriesThenSucceeds(t *testing.T) {
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls < 3 {
+			w.WriteHeader(529)
+			w.Write([]byte(`{"type":"error","error":{"type":"overloaded_error","message":"busy"}}`))
+			return
+		}
+		w.Write([]byte(`{"content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":3}}`))
+	}))
+	defer srv.Close()
+	var logged []string
+	a := &Anthropic{APIKey: "k", BaseURL: srv.URL, Backoff: time.Millisecond, Log: func(s string) { logged = append(logged, s) }}
+	out, err := a.Complete(context.Background(), "", "x")
+	if err != nil || out != "ok" || calls != 3 {
+		t.Fatalf("out=%q err=%v calls=%d", out, err, calls)
+	}
+	if u := a.Usage(); u.Calls != 1 || u.InputTokens != 10 || u.OutputTokens != 3 {
+		t.Fatalf("usage %+v", u)
+	}
+	if len(logged) != 3 || !strings.Contains(logged[0], "retrying") {
+		t.Fatalf("log %v", logged)
+	}
+}
+
+func TestAnthropicDoesNotRetryClientErrors(t *testing.T) {
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(401)
+		w.Write([]byte(`{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}`))
+	}))
+	defer srv.Close()
+	_, err := (&Anthropic{APIKey: "k", BaseURL: srv.URL, Backoff: time.Millisecond}).Complete(context.Background(), "", "x")
+	if err == nil || calls != 1 || !strings.Contains(err.Error(), "authentication_error") {
+		t.Fatalf("err=%v calls=%d", err, calls)
+	}
+}
+
+func TestAnthropicTruncatedReplyIsAnError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("{\"content\":[{\"type\":\"text\",\"text\":\"```go\\npackage main\\nfunc ma\"}],\"stop_reason\":\"max_tokens\"}"))
+	}))
+	defer srv.Close()
+	_, err := (&Anthropic{APIKey: "k", BaseURL: srv.URL}).Complete(context.Background(), "", "x")
+	if !errors.Is(err, ErrTruncated) {
+		t.Fatalf("err = %v", err)
 	}
 }
 
