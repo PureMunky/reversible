@@ -21,6 +21,8 @@ const Contract = `- package main, a single file main.go, Go standard library onl
 - a field with transitions may only change from a state to one of the states listed for it (409 otherwise); a state with no entry can't change
 - the caller is identified by the X-Caller request header; if a resource lists writers, only they may create, update or delete it (403 otherwise; anyone may read); a rule's except_callers lists callers it does not apply to; a delete refused by a rule is 409
 - every error response is JSON {"error": "<message>"}; GET /healthz returns 200
+- a computed field is set only by its behaviour, never by callers (400 if a request sets it); it is recomputed on every create, update and action
+- a resource's behaviours are logic stated in words (rule) and pinned down by the examples that name them: computed behaviours set a computed field; check behaviours may refuse a create or update with a status and reason; an action behaviour is POST /<plural>/{key}/<action>, answering 200 with its result (or the record) or refusing with a status and reason; after an action the record must still be valid, follow its transitions (409 otherwise) and pass its checks
 - the spec's examples are the contract: they will be run in order against a fresh instance and every one must pass`
 
 // Coder turns intent into source files. A previous attempt and the
@@ -37,6 +39,9 @@ type Codegen struct{}
 func (Codegen) Code(_ context.Context, s ServiceSpec, _ map[string]string, _ []Result) (map[string]string, error) {
 	if qs := s.Check(); !Ready(qs) {
 		return nil, fmt.Errorf("spec is not ready: %v", qs[0])
+	}
+	if s.HasBehaviours() {
+		return nil, fmt.Errorf("this spec has behaviours, which are stated in words: a model has to write them (BehaviourCoder), on top of the structure Codegen generates")
 	}
 	return map[string]string{"main.go": generate(s)}, nil
 }
@@ -107,6 +112,23 @@ func generate(s ServiceSpec) string {
 
 	for _, r := range all {
 		genTypes(w, s, *r)
+	}
+	if s.HasBehaviours() {
+		w(`// Refusal is how behaviour code refuses a request: the status and the
+// reason the caller sees.
+type Refusal struct {
+	Status  int
+	Message string
+}
+
+func refuse(status int, format string, args ...any) *Refusal {
+	return &Refusal{Status: status, Message: fmt.Sprintf(format, args...)}
+}
+
+`)
+		for _, r := range all {
+			genBehave(w, *r)
+		}
 	}
 
 	w(`var (
@@ -390,7 +412,7 @@ func genHandlers(w func(string, ...any), s ServiceSpec, r Resource) {
 			fail(w, 400, msg)
 			return
 		}
-		for _, f := range required%[1]s {
+%[5]s		for _, f := range required%[1]s {
 			if _, ok := raw[f]; !ok {
 				fail(w, 400, f+" is required")
 				return
@@ -409,12 +431,12 @@ func genHandlers(w func(string, ...any), s ServiceSpec, r Resource) {
 			fail(w, 409, fmt.Sprintf("%[3]s %%s already exists", rec.%[2]s))
 			return
 		}
-		store%[1]s[rec.%[2]s] = rec
+%[4]s		store%[1]s[rec.%[2]s] = rec
 		save()
 		reply(w, 201, rec)
 	})
 
-`, T, K, r.Name)
+`, T, K, r.Name, behaveCall(r, "nil", "create"), computedReject(r))
 
 	// list, with filters
 	w("\tmux.HandleFunc(\"GET %s\", func(w http.ResponseWriter, r *http.Request) {\n", base)
@@ -454,7 +476,7 @@ func genHandlers(w func(string, ...any), s ServiceSpec, r Resource) {
 			fail(w, 400, msg)
 			return
 		}
-		rec, ok := store%[1]s[key]
+%[5]s		rec, ok := store%[1]s[key]
 		if !ok {
 			fail(w, 404, fmt.Sprintf("%[3]s %%s not found", key))
 			return
@@ -473,7 +495,7 @@ func genHandlers(w func(string, ...any), s ServiceSpec, r Resource) {
 			fail(w, 400, msg)
 			return
 		}
-`, T, K, r.Name, r.Key)
+`, T, K, r.Name, r.Key, computedReject(r))
 	for _, f := range r.Fields {
 		if len(f.Transitions) == 0 {
 			continue
@@ -494,12 +516,14 @@ func genHandlers(w func(string, ...any), s ServiceSpec, r Resource) {
 		}
 		w("}\n\t\t\tif !oneOf(rec.%s, allowed[old.%s]...) {\n\t\t\t\tfail(w, 409, fmt.Sprintf(%q, old.%s, rec.%s))\n\t\t\t\treturn\n\t\t\t}\n\t\t}\n", g, g, msg, g, g)
 	}
+	w("%s", behaveCall(r, "&old", "update"))
 	w(`		store%[1]s[key] = rec
 		save()
 		reply(w, 200, rec)
 	})
 
 `, T)
+	genActions(w, r)
 
 	// delete
 	w("\tmux.HandleFunc(\"DELETE %s/{key}\", func(w http.ResponseWriter, r *http.Request) {\n", base)
@@ -548,3 +572,166 @@ func genHandlers(w func(string, ...any), s ServiceSpec, r Resource) {
 }
 
 func oneLine(s string) string { return strings.Join(strings.Fields(s), " ") }
+
+// ── behaviours: the structure calls code a model writes ──────────────
+
+// hookName is a behaviour's Go name.
+func hookName(b Behaviour) string { return goName(b.Name) }
+
+// computedReject refuses requests that set computed fields.
+func computedReject(r Resource) string {
+	var b strings.Builder
+	for _, bh := range r.Behaviours {
+		if bh.Kind != "computed" {
+			continue
+		}
+		fmt.Fprintf(&b, "\t\tif _, ok := raw[%q]; ok {\n\t\t\tfail(w, 400, %q)\n\t\t\treturn\n\t\t}\n", bh.Field, bh.Field+" is computed ("+oneLine(bh.Rule)+"); it can't be set")
+	}
+	return b.String()
+}
+
+// behaveCall runs a resource's computed and check behaviours, if it has any.
+func behaveCall(r Resource, old, op string) string {
+	if len(r.Behaviours) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("\t\tif ref := behave%s(%s, &rec, %q, caller(r)); ref != nil {\n\t\t\tfail(w, ref.Status, ref.Message)\n\t\t\treturn\n\t\t}\n", goName(r.Name), old, op)
+}
+
+// genBehave writes the function that runs a resource's computed
+// behaviours, then its checks, around every write.
+func genBehave(w func(string, ...any), r Resource) {
+	if len(r.Behaviours) == 0 {
+		return
+	}
+	T := goName(r.Name)
+	w("// behave%s runs %s's computed behaviours, then the checks for op.\n", T, r.Name)
+	w("func behave%s(old *%s, rec *%s, op, caller string) *Refusal {\n", T, T, T)
+	for _, b := range r.Behaviours {
+		if b.Kind == "computed" {
+			w("\tif v, ref := compute%s(*rec); ref != nil {\n\t\treturn ref\n\t} else {\n\t\trec.%s = v\n\t}\n", hookName(b), goName(b.Field))
+		}
+	}
+	for _, b := range r.Behaviours {
+		if b.Kind != "check" {
+			continue
+		}
+		var ops []string
+		for _, op := range []string{"create", "update"} {
+			if b.Checks(op) {
+				ops = append(ops, fmt.Sprintf("op == %q", op))
+			}
+		}
+		w("\tif %s {\n\t\tif ref := check%s(old, *rec, caller); ref != nil {\n\t\t\treturn ref\n\t\t}\n\t}\n", strings.Join(ops, " || "), hookName(b))
+	}
+	w("\treturn nil\n}\n\n")
+}
+
+// genActions writes a resource's action endpoints.
+func genActions(w func(string, ...any), r Resource) {
+	T := goName(r.Name)
+	K := goName(r.Key)
+	writers := ""
+	if len(r.Writers) > 0 {
+		writers = fmt.Sprintf("\t\tif !oneOf(caller(r), %s) {\n\t\t\tfail(w, 403, caller(r)+%q)\n\t\t\treturn\n\t\t}\n", quoteList(r.Writers), " may not change "+r.Plural)
+	}
+	for _, b := range r.Behaviours {
+		if b.Kind != "action" {
+			continue
+		}
+		w("\t// %s: %s\n", b.Name, oneLine(b.Rule))
+		w("\tmux.HandleFunc(\"POST /%s/{key}/%s\", func(w http.ResponseWriter, r *http.Request) {\n", r.Plural, b.Action)
+		w("%s", writers)
+		w(`		key := r.PathValue("key")
+		rec, ok := store%[1]s[key]
+		if !ok {
+			fail(w, 404, fmt.Sprintf("%[3]s %%s not found", key))
+			return
+		}
+		in := map[string]json.RawMessage{}
+		if r.ContentLength != 0 {
+			if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+				fail(w, 400, "body must be a JSON object")
+				return
+			}
+		}
+		old := rec
+		out, ref := action%[4]s(&rec, in, caller(r))
+		if ref != nil {
+			fail(w, ref.Status, ref.Message)
+			return
+		}
+		if rec.%[2]s != key {
+			fail(w, 500, "%[5]s changed the key")
+			return
+		}
+		if msg := validate%[1]s(rec); msg != "" {
+			fail(w, 500, "%[5]s left the record invalid: "+msg)
+			return
+		}
+`, T, K, r.Name, hookName(b), b.Name)
+		for _, f := range r.Fields {
+			if len(f.Transitions) == 0 {
+				continue
+			}
+			g := goName(f.Name)
+			w("\t\tif rec.%s != old.%s {\n\t\t\tallowed := map[string][]string{", g, g)
+			froms := make([]string, 0, len(f.Transitions))
+			for from := range f.Transitions {
+				froms = append(froms, from)
+			}
+			sort.Strings(froms)
+			for _, from := range froms {
+				w("%q: {%s}, ", from, quoteList(f.Transitions[from]))
+			}
+			msg := f.Name + " can't change from %s to %s"
+			if f.Why != "" {
+				msg += " (" + f.Why + ")"
+			}
+			w("}\n\t\t\tif !oneOf(rec.%s, allowed[old.%s]...) {\n\t\t\t\tfail(w, 409, fmt.Sprintf(%q, old.%s, rec.%s))\n\t\t\t\treturn\n\t\t\t}\n\t\t}\n", g, g, msg, g, g)
+		}
+		w("%s", behaveCall(r, "&old", "update"))
+		w(`		store%[1]s[key] = rec
+		save()
+		if out == nil {
+			out = rec
+		}
+		reply(w, 200, out)
+	})
+
+`, T)
+	}
+}
+
+// Hooks lists the functions a model must write for a spec's behaviours,
+// as Go declarations with doc comments.
+func Hooks(s ServiceSpec) string {
+	var b strings.Builder
+	for _, r := range s.All() {
+		T := goName(r.Name)
+		for _, bh := range r.Behaviours {
+			fmt.Fprintf(&b, "// %s (%s, on %s): %s\n", bh.Name, bh.Kind, r.Plural, oneLine(bh.Rule))
+			if bh.Why != "" {
+				fmt.Fprintf(&b, "// Why: %s\n", oneLine(bh.Why))
+			}
+			switch bh.Kind {
+			case "computed":
+				f, _ := fieldOf(*r, bh.Field)
+				fmt.Fprintf(&b, "// Returns the value of %s.%s for rec (called on every create, update and action), or a refusal.\nfunc compute%s(rec %s) (%s, *Refusal)\n\n", r.Name, bh.Field, hookName(bh), T, goType(f.Type))
+			case "check":
+				on := "create and update"
+				if len(bh.On) > 0 {
+					on = strings.Join(bh.On, " and ")
+				}
+				fmt.Fprintf(&b, "// Called on %s after computed fields are set; old is nil on create. Return nil to allow.\nfunc check%s(old *%s, rec %s, caller string) *Refusal\n\n", on, hookName(bh), T, T)
+			case "action":
+				fmt.Fprintf(&b, "// POST /%s/{key}/%s. May change *rec; in is the request body's fields. Return the response body (nil for the record), or a refusal.\nfunc action%s(rec *%s, in map[string]json.RawMessage, caller string) (any, *Refusal)\n\n", r.Plural, bh.Action, hookName(bh), T)
+			}
+		}
+	}
+	return b.String()
+}
+
+// Structure is the generated main.go for a spec: everything but its
+// behaviours. A BehaviourCoder's model writes against it.
+func Structure(s ServiceSpec) string { return generate(s) }

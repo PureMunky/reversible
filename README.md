@@ -40,6 +40,10 @@ With `-brittle-coder`, the v2 build fails reads of any flag with a description. 
 
 With `-faulty-coder`, the v2 build still passes all 12 examples, but reading production data through it shows every existing flag that was on silently dropping to 0% rollout. That change isn't explained by anything Phil asked for, so it isn't released. Examples alone would have shipped it.
 
+### Logic only words can state
+
+`go run ./cmd/bookings` builds appointment booking for a small business, including what no generator can write. The weekend surcharge, no double-booking, opening hours, and cancellation refunds are each a **behaviour**: a rule in plain language, pinned down by examples. The factory generates the structure (676 lines). A model writes the behaviours against it (122 lines). The examples, the review and the canary judge the result like anything else. When the owner changes a rule ("closed Sundays; no refund for late cancellations"), the review traces every difference on real traffic to the behaviour that changed, by name. Behaviour that changes when the intent didn't is flagged as drift. Offline, the behaviour code is a recorded model reply to the exact prompt; with a key, Claude writes it fresh. This is phase 1 of building a full SaaS from intent: [docs/SAAS-PLAN.md](docs/SAAS-PLAN.md).
+
 ### The same factory, another kind of software
 
 Feature flags are an example, and so is the next one. `go run ./cmd/incidents` uses the same factory, with nothing in it specific to either domain, to build an incident tracker for an on-call rotation: two resources (services and incidents) that reference each other, a lifecycle (open → acknowledged → resolved), filters (`GET /incidents?status=open`) and who may change what. All of it is intent; none of it is code a person writes.

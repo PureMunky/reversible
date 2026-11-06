@@ -45,6 +45,37 @@ type Resource struct {
 	// Writers are the callers (by X-Caller) allowed to create, update and
 	// delete; anyone may read. Empty means anyone may write.
 	Writers []string `json:"writers,omitempty"`
+	// Behaviours are logic the structured fields can't express, stated in
+	// words and pinned down by examples: see Behaviour.
+	Behaviours []Behaviour `json:"behaviours,omitempty"`
+}
+
+// Behaviour is logic the spec states in words, with examples as its
+// contract: the part of a service the structured spec can't say, and
+// that a model writes. The factory generates everything structural and
+// calls the model's code at fixed points; the examples, the review and
+// the canary judge it like any other behaviour.
+//
+// Kinds:
+//   - computed: sets a computed field from the record (and others) on
+//     every create, update and action
+//   - check:    may refuse a create or update (On), with a status and reason
+//   - action:   an operation beyond create/read/update/delete,
+//     POST /<plural>/{key}/<action>, that may change the record and
+//     answers with a status and body
+type Behaviour struct {
+	Name   string   `json:"name"`             // lowercase, digits and _; unique in the service
+	Kind   string   `json:"kind"`             // computed, check, action
+	Field  string   `json:"field,omitempty"`  // computed: the field it sets
+	Action string   `json:"action,omitempty"` // action: the URL segment
+	On     []string `json:"on,omitempty"`     // check: create and/or update (default both)
+	Rule   string   `json:"rule"`             // what it does, precisely, in words
+	Why    string   `json:"why,omitempty"`
+}
+
+// Checks reports whether a check behaviour runs on op (create or update).
+func (b Behaviour) Checks(op string) bool {
+	return b.Kind == "check" && (len(b.On) == 0 || contains(b.On, op))
 }
 
 // Field is one property of a resource.
@@ -65,7 +96,9 @@ type Field struct {
 	// Transitions restricts how an enum field may change: from each state,
 	// the states it may move to. A state with no entry can't change.
 	Transitions map[string][]string `json:"transitions,omitempty"`
-	Why         string              `json:"why,omitempty"`
+	// Computed fields are set by a computed behaviour, never by callers.
+	Computed bool   `json:"computed,omitempty"`
+	Why      string `json:"why,omitempty"`
 }
 
 // Rule is a behavioural constraint beyond field validation.
@@ -86,9 +119,12 @@ type Condition struct {
 // Example is one step of a scenario: a request and what must come back.
 // Examples run in order against a fresh instance, so state carries.
 type Example struct {
-	Name    string     `json:"name"`
-	Request HTTPCall   `json:"request"`
-	Expect  Expectancy `json:"expect"`
+	Name string `json:"name"`
+	// Behaviour names the behaviour this example pins down, if any. Every
+	// behaviour needs at least one: it's the only definition of right.
+	Behaviour string     `json:"behaviour,omitempty"`
+	Request   HTTPCall   `json:"request"`
+	Expect    Expectancy `json:"expect"`
 }
 
 // HTTPCall is a request.
@@ -107,6 +143,17 @@ type HTTPCall struct {
 type Expectancy struct {
 	Status int `json:"status"`
 	Body   any `json:"body,omitempty"`
+}
+
+// HasBehaviours reports whether any resource has behaviours (which a
+// model must write).
+func (s *ServiceSpec) HasBehaviours() bool {
+	for _, r := range s.All() {
+		if len(r.Behaviours) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // All returns the resources the service manages, in either form.
@@ -150,6 +197,7 @@ func (s *ServiceSpec) Route(c HTTPCall) (*Resource, string) {
 func (r Resource) KeyOf(c HTTPCall) string {
 	p := pathOnly(c.Path)
 	if k, ok := strings.CutPrefix(p, "/"+r.Plural+"/"); ok {
+		k, _, _ = strings.Cut(k, "/") // an action: /plural/{key}/action
 		return k
 	}
 	if m, ok := c.Body.(map[string]any); ok && c.Method == "POST" {
@@ -277,6 +325,32 @@ func (s ServiceSpec) Check() []Question {
 
 	if len(s.Examples) == 0 {
 		ask(Blocking, "examples", "how will we know it works? Give examples of requests and the responses you expect")
+	}
+	behaviours := map[string]bool{}
+	for _, r := range all {
+		for _, b := range r.Behaviours {
+			if behaviours[b.Name] {
+				ask(Blocking, "behaviours", "behaviour %q is defined twice", b.Name)
+			}
+			behaviours[b.Name] = true
+		}
+	}
+	shown := map[string]bool{}
+	for i, e := range s.Examples {
+		if e.Behaviour == "" {
+			continue
+		}
+		if !behaviours[e.Behaviour] {
+			ask(Blocking, fmt.Sprintf("examples[%d] (%s)", i, e.Name), "shows behaviour %q, which isn't defined", e.Behaviour)
+		}
+		shown[e.Behaviour] = true
+	}
+	for _, r := range all {
+		for _, b := range r.Behaviours {
+			if !shown[b.Name] {
+				ask(Blocking, "behaviours ("+b.Name+")", "no example shows %s; examples are the only definition of right, so the code written for it would be unchecked", b.Name)
+			}
+		}
 	}
 	type key struct{ res, op string }
 	covered := map[key]bool{}
@@ -437,6 +511,60 @@ func (s *ServiceSpec) checkResource(r Resource, at string, ask func(Severity, st
 		}
 	}
 
+	computedBy := map[string]int{}
+	actions := map[string]bool{}
+	for i, b := range r.Behaviours {
+		where := fmt.Sprintf("%s.behaviours[%d]", at, i)
+		if !ident.MatchString(b.Name) {
+			ask(Blocking, where, "behaviour name %q must be lowercase letters, digits and _", b.Name)
+			continue
+		}
+		where += " (" + b.Name + ")"
+		if strings.TrimSpace(b.Rule) == "" {
+			ask(Blocking, where, "what does it do? The rule, in words, is what the code is written from")
+		}
+		switch b.Kind {
+		case "computed":
+			f, ok := fields[b.Field]
+			switch {
+			case !ok:
+				ask(Blocking, where, "computes %q, which isn't a field of %s", b.Field, r.Name)
+			case !f.Computed:
+				ask(Blocking, where, "computes %q, so that field must be marked computed (callers can't set it)", b.Field)
+			}
+			computedBy[b.Field]++
+		case "check":
+			for _, op := range b.On {
+				if op != "create" && op != "update" {
+					ask(Blocking, where, "checks run on create and/or update, not %q", op)
+				}
+			}
+		case "action":
+			if !ident.MatchString(b.Action) {
+				ask(Blocking, where, "action %q must be lowercase letters, digits and _ (it's a URL segment)", b.Action)
+			} else if actions[b.Action] {
+				ask(Blocking, where, "action %q is defined twice", b.Action)
+			}
+			actions[b.Action] = true
+		default:
+			ask(Blocking, where, "kind %q is not one of computed, check, action", b.Kind)
+		}
+	}
+	for _, f := range r.Fields {
+		if !f.Computed {
+			continue
+		}
+		switch {
+		case computedBy[f.Name] == 0:
+			ask(Blocking, at+".fields ("+f.Name+")", "%s is computed: which behaviour computes it?", f.Name)
+		case computedBy[f.Name] > 1:
+			ask(Blocking, at+".fields ("+f.Name+")", "%s is computed by %d behaviours; which one?", f.Name, computedBy[f.Name])
+		}
+		if f.Required || f.Name == r.Key {
+			ask(Blocking, at+".fields ("+f.Name+")", "a computed field can't be required or the key: callers don't set it")
+		}
+	}
+
 	for i, rule := range r.Rules {
 		where := fmt.Sprintf("%s.rules[%d]", at, i)
 		c := rule.ForbidDeleteWhen
@@ -472,6 +600,13 @@ func endpointOf(r Resource, c HTTPCall) string {
 		return "create"
 	case path == base && c.Method == "GET":
 		return "list"
+	case strings.HasPrefix(path, base+"/") && strings.Count(path[len(base)+1:], "/") == 1 && c.Method == "POST":
+		_, action, _ := strings.Cut(path[len(base)+1:], "/")
+		for _, b := range r.Behaviours {
+			if b.Kind == "action" && b.Action == action {
+				return "action:" + b.Name
+			}
+		}
 	case strings.HasPrefix(path, base+"/") && !strings.Contains(path[len(base)+1:], "/"):
 		switch c.Method {
 		case "GET":

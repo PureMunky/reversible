@@ -1,0 +1,131 @@
+```go
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"math"
+	"time"
+)
+
+const (
+	opensAt  = 9 * 60  // 09:00, in minutes after midnight
+	closesAt = 17 * 60 // 17:00
+)
+
+// roundCents rounds an amount to cents.
+func roundCents(x float64) float64 { return math.Round(x*100) / 100 }
+
+// minutesOf parses HH:MM into minutes after midnight.
+func minutesOf(hhmm string) (int, bool) {
+	t, err := time.Parse("15:04", hhmm)
+	if err != nil {
+		return 0, false
+	}
+	return t.Hour()*60 + t.Minute(), true
+}
+
+// span is the [start, end) a booking occupies, in minutes after midnight.
+func span(b Booking) (start, end int, ok bool) {
+	start, ok = minutesOf(b.Time)
+	if !ok {
+		return 0, 0, false
+	}
+	svc, found := storeService[b.Service]
+	if !found {
+		return 0, 0, false
+	}
+	return start, start + int(svc.Minutes), true
+}
+
+func computeBookingPrice(rec Booking) (float64, *Refusal) {
+	svc, ok := storeService[rec.Service]
+	if !ok {
+		return 0, refuse(400, "service: service %s not found", rec.Service)
+	}
+	day, err := time.Parse("2006-01-02", rec.Date)
+	if err != nil {
+		return 0, refuse(400, "date %s is not a real date (YYYY-MM-DD)", rec.Date)
+	}
+	price := svc.Price
+	if wd := day.Weekday(); wd == time.Saturday || wd == time.Sunday {
+		price *= 1.25
+	}
+	return roundCents(price), nil
+}
+
+func checkNoDoubleBooking(old *Booking, rec Booking, caller string) *Refusal {
+	if rec.Status != "confirmed" {
+		return nil
+	}
+	start, end, ok := span(rec)
+	if !ok {
+		return refuse(400, "time %s is not a valid time (HH:MM)", rec.Time)
+	}
+	for _, other := range sortedBooking() {
+		if other.Id == rec.Id || other.Status != "confirmed" || other.Date != rec.Date {
+			continue
+		}
+		os, oe, ok := span(other)
+		if !ok {
+			continue
+		}
+		if start < oe && os < end {
+			return refuse(409, "booking %s clashes with booking %s (%s, %s to %s)", rec.Id, other.Id, other.Date, other.Time, clock(oe))
+		}
+	}
+	return nil
+}
+
+func checkOpeningHours(old *Booking, rec Booking, caller string) *Refusal {
+	if rec.Status != "confirmed" {
+		return nil
+	}
+	start, end, ok := span(rec)
+	if !ok {
+		return refuse(400, "time %s is not a valid time (HH:MM)", rec.Time)
+	}
+	day, err := time.Parse("2006-01-02", rec.Date)
+	if err != nil {
+		return refuse(400, "date %s is not a real date (YYYY-MM-DD)", rec.Date)
+	}
+	if day.Weekday() == time.Sunday {
+		return refuse(400, "closed on Sundays: bookings are Monday to Saturday, %s to %s", clock(opensAt), clock(closesAt))
+	}
+	if start < opensAt || end > closesAt {
+		return refuse(400, "bookings must fit within opening hours, Monday to Saturday %s to %s (this one runs %s to %s)", clock(opensAt), clock(closesAt), clock(start), clock(end))
+	}
+	return nil
+}
+
+func actionCancelBooking(rec *Booking, in map[string]json.RawMessage, caller string) (any, *Refusal) {
+	if rec.Status == "cancelled" {
+		return nil, refuse(409, "booking %s is already cancelled", rec.Id)
+	}
+	raw, ok := in["at"]
+	if !ok {
+		return nil, refuse(400, "at is required: when the booking is cancelled, as YYYY-MM-DDTHH:MM")
+	}
+	var atText string
+	if err := json.Unmarshal(raw, &atText); err != nil {
+		return nil, refuse(400, "at must be a string, YYYY-MM-DDTHH:MM")
+	}
+	at, err := time.Parse("2006-01-02T15:04", atText)
+	if err != nil {
+		return nil, refuse(400, "at %q is not in the form YYYY-MM-DDTHH:MM", atText)
+	}
+	starts, err := time.Parse("2006-01-02 15:04", rec.Date+" "+rec.Time)
+	if err != nil {
+		return nil, refuse(400, "booking %s has no valid start (%s %s)", rec.Id, rec.Date, rec.Time)
+	}
+	refund := rec.Price
+	if starts.Sub(at) < 24*time.Hour {
+		refund = 0 // late cancellations aren't refunded
+	}
+	rec.Status = "cancelled"
+	return map[string]any{"id": rec.Id, "status": rec.Status, "refund": refund}, nil
+}
+
+// clock formats minutes after midnight as HH:MM.
+func clock(m int) string { return fmt.Sprintf("%02d:%02d", m/60, m%60) }
+```

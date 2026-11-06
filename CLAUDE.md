@@ -11,4 +11,6 @@ Everything here exists to serve that idea. When you plan, build, document or com
 - **Commit messages** end their body with a line `Toward the root idea: ...` naming the principle the change serves.
 - **Keep `PRINCIPLES.md` current.** Update its "where the repo stands" table when a principle moves forward.
 
-Engineering conventions: Go, standard library only; `gofmt`, `go vet` and `go test -race ./...` must pass; every demo runs in CI with assertions on its output.
+Engineering conventions: Go, standard library only, for the factory and everything in this repo; `gofmt`, `go vet` and `go test -race ./...` must pass; every demo runs in CI with assertions on its output. Apps the factory *generates* may use a small, pinned, reviewed dependency allowlist once it exists (decided in `docs/SAAS-PLAN.md`); nothing else may add dependencies.
+
+The current goal is a full SaaS built from intent, phase by phase: `docs/SAAS-PLAN.md`. Update its phase table when a phase lands.

@@ -44,6 +44,7 @@ Each rung tests one more thing than the last. Don't skip `check`.
 | 3. Rehearsal | `run.sh rehearse` | The live path works end to end. The run token reaches the pod. Requests go through the model gateway and come back (one is refused as overloaded and retried). Replies are parsed, and the code in them is built by the factory and run in the sandbox. Afterwards, the sandbox is checked for visible credentials. A stand-in API (`cmd/fakeclaude`) writes the generator's code | None |
 | 4. Key | `run.sh key` | Stores your key in a Secret that only the model gateway reads. Input is hidden; the key goes through stdin, never an argument or a file | None |
 | 5. Live | `run.sh live` | Claude writes every version of the incident tracker's code from the intent; the examples, the review and the canary decide whether each ships | 3–9 model calls |
+| 5b. Behaviours, live | `run.sh rehearse bookings`, then `run.sh live bookings` | Claude writes logic stated in words (pricing, no double-booking, opening hours, refunds) on top of generated structure. Rehearsal replays recorded replies through the gateway; live asks Claude | 2–6 model calls, cheap (~10k tokens in, ~1k out each) |
 | 6. Live, from conversation | `run.sh live factory` | Claude drafts the feature-flag specs from conversation and writes the code | 5–12 model calls |
 
 `live` explains what it's about to do and asks before starting (`YES=1` skips the prompt). Choose a model with `REVERSIBLE_MODEL=claude-opus-5-5 deploy/kind/run.sh live`; the default is `claude-sonnet-5-5`.
@@ -219,7 +220,9 @@ deploy/kind/run.sh image              # rebuild and load the image
 deploy/kind/run.sh offline            # or rehearse, or live
 ```
 
-If the spec isn't ready, the story stops at step 1 with the checker's questions. The format, briefly (the incident specs are complete examples of everything):
+If the spec isn't ready, the story stops at step 1 with the checker's questions. Logic the fields can't express goes in a resource's `behaviours`: a rule in words, of kind `computed` (sets a field marked `"computed": true`), `check` (may refuse a create or update) or `action` (`POST /<plural>/{key}/<action>`). Each needs at least one example naming it with `"behaviour": "<name>"`. A model writes them; `cmd/bookings/intent/bookings-1.json` is a complete example. Offline, a changed behaviour has no recorded reply, so the story stops and asks for a live run. `go run ./cmd/bookings -record cmd/bookings/recordings` with a key records new replies.
+
+The format, briefly (the incident specs are complete examples of everything else):
 
 ```jsonc
 {
@@ -281,10 +284,10 @@ Then revoke the key in the Anthropic Console if you made it for this.
 | `up` | Create the cluster (with Calico), build and load the image, apply the namespace, network rules, model gateway and rehearsal stand-in |
 | `image` | Rebuild and reload the image (after changing code or intent) |
 | `check` | Prove the network rules are enforced: offline pods reach nothing, demo pods only the gateway, the gateway only the API |
-| `offline [incidents\|factory]` | Run a demo with the deterministic generator, no network |
-| `rehearse` | Run the incident tracker through the live path (gateway, sandbox) against the stand-in API |
+| `offline [incidents\|bookings\|factory]` | Run a demo with the deterministic generator, no network |
+| `rehearse [incidents\|bookings]` | Run through the live path (gateway, sandbox) against the stand-in API (bookings: recorded behaviour code) |
 | `key` | Store the API key for the model gateway (prompted, hidden; or from `ANTHROPIC_API_KEY`) |
-| `live [incidents\|factory]` | Run a demo with Claude |
+| `live [incidents\|bookings\|factory]` | Run a demo with Claude |
 | `open` | Port-forward the running demo to `localhost:${LOCAL_PORT:-8080}` (works from the start of a run, for telemetry) |
 | `observe` | Add Prometheus and Grafana (namespace `observe`), scraping the demo |
 | `dashboards` | Port-forward Grafana to `localhost:3000` and Prometheus to `localhost:9090` |

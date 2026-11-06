@@ -27,7 +27,7 @@ spec:
         - name: fakeclaude
           image: reversible:dev
           imagePullPolicy: Never
-          args: ["fakeclaude", "-addr", ":8080", "-flaky", "1"]
+          args: ["fakeclaude", "-addr", ":8080", "-flaky", "1", "-recordings", "/opt/reversible/recordings"]
           ports:
             - {name: http, containerPort: 8080}
           readinessProbe:

@@ -34,7 +34,8 @@ A person appears at four points only: stating intent, answering questions, signi
 |---|---|---|---|
 | **Spec** | `factory` (`spec.go`) | The source of truth: resources, fields, references, lifecycles (`transitions`), filters, writers, rules, and examples that are the contract. `Check` returns blocking and clarifying questions; nothing blocked is built. A spec's hash names everything built from it. | None (it's data) |
 | **Capture** | `factory` (`capture.go`) | Asks a model to turn a conversation (plus the current spec, if any) into a spec and its own questions. The reply is parsed strictly and then checked like any other spec. | None |
-| **Coder** | `factory` (`codegen.go`, `coder.go`) | Writes `main.go` from the spec. `Codegen` is a deterministic compiler (offline); `ModelCoder` asks a model, and on failure sends back its previous code and exactly which checks failed. | None |
+| **Coder** | `factory` (`codegen.go`, `coder.go`) | Writes the service from the spec. `Codegen` is a deterministic compiler for everything structural. `BehaviourCoder` adds a model for behaviours (logic stated in words): the generator writes `main.go` with fixed hooks, the model writes `behaviours.go`. `ModelCoder` has a model write the whole file. On failure, each model coder gets back its previous code and exactly which checks failed. | None |
+| **Recordings** | `model` (`recording.go`) | `Recorder` saves each model reply under the hash of the exact prompt; `Replayer` answers only those prompts. Offline runs and CI replay recorded replies, so a changed spec can never be answered by a stale one. | Reply files |
 | **Factory** | `factory` (`factory.go`, `build.go`) | Builds the code with `go build` (standard library only, no network), starts it as a separate process, runs every example in order against a fresh instance, retries the coder up to three times. Caches each build by spec hash. | `builds/<spec hash>/` |
 | **Generated service** | output | A small HTTP service meeting a fixed contract: listens on `ADDR`, prints `LISTENING <url>`, keeps state in the JSON file at `DATA`, reads it on every request, preserves fields and resources it doesn't know (so two versions can share data), and treats the `X-Caller` header as the caller's identity. | The `DATA` file |
 | **Router** | `factory` (`router.go`) | Production's front door. Forwards each request to the live version, or to a canary for a share of requests, and records every exchange (request, response, serving version, latency). Snapshots the data at each release. | Traffic log (memory), data snapshots |
@@ -308,6 +309,7 @@ Requests to the scratch instances the factory starts for examples, replays and c
 |---|---|---|---|
 | Conversation → spec | `Capture` | — / 2 | A few thousand tokens in, up to a few thousand out |
 | Spec → code | `ModelCoder` | 3–9 / 3–9 (3 builds, up to 3 attempts each) | ~3,000 tokens in plus the previous code on a retry; ~4,000–6,000 out for these services |
+| Behaviours → code | `BehaviourCoder` (`cmd/bookings`) | 2–6 (2 builds, up to 3 attempts each) | ~9,500 tokens in (hooks, examples, spec, generated code); ~1,000 out |
 
 The default model is `claude-sonnet-5-5` (`REVERSIBLE_MODEL` overrides it). Replies aren't streamed, so the HTTP timeout is ten minutes. Every call's tokens and duration are logged, and the total prints at exit. In kind, every call also passes through the model gateway, which caps the run (15 calls and 150,000 output tokens by default, enough for either demo with every repair attempt) and logs each call with what's left.
 

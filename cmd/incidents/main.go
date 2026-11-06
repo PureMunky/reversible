@@ -335,9 +335,9 @@ func finish(g *decision.Graph, store decision.Log, keys *decision.Keyring, gener
 		fmt.Print(", chain verifies ✓")
 	}
 	fmt.Println()
-	fmt.Println("\n   What's still missing for any software to be built this way: the spec language covers")
-	fmt.Println("   records, relations, lifecycles and access. Computation, jobs, events and integrations")
-	fmt.Println("   with other systems still have to be written by hand (see PRINCIPLES.md).")
+	fmt.Println("\n   What's still missing for a full SaaS to be built this way: a real database, a web front end,")
+	fmt.Println("   tenants and accounts, jobs and time, email and payments (docs/SAAS-PLAN.md). Logic stated in")
+	fmt.Println("   words is covered: see cmd/bookings.")
 }
 
 // weekOne: the platform team registers services; on-call works incidents;

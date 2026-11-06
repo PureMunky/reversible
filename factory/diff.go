@@ -161,12 +161,13 @@ type explainer struct {
 	diverged  map[string]string
 	newFields map[string]map[string]bool // resource -> fields the intent added
 	changed   map[string]map[string]bool // resource -> fields whose definition changed
+	behaviour map[string][]Behaviour     // resource -> behaviours new or changed in the new intent
 	oldSpec   ServiceSpec
 	newSpec   ServiceSpec
 }
 
 func newExplainer(oldS, newS ServiceSpec) *explainer {
-	e := &explainer{newFields: map[string]map[string]bool{}, changed: map[string]map[string]bool{}, diverged: map[string]string{}, oldSpec: oldS, newSpec: newS}
+	e := &explainer{newFields: map[string]map[string]bool{}, changed: map[string]map[string]bool{}, behaviour: map[string][]Behaviour{}, diverged: map[string]string{}, oldSpec: oldS, newSpec: newS}
 	for _, nr := range newS.All() {
 		e.newFields[nr.Name], e.changed[nr.Name] = map[string]bool{}, map[string]bool{}
 		or := oldS.Named(nr.Name)
@@ -182,6 +183,17 @@ func newExplainer(oldS, newS ServiceSpec) *explainer {
 				e.newFields[nr.Name][f.Name] = true
 			} else if !reflect.DeepEqual(o, f) {
 				e.changed[nr.Name][f.Name] = true
+			}
+		}
+		oldB := map[string]Behaviour{}
+		if or != nil {
+			for _, b := range or.Behaviours {
+				oldB[b.Name] = b
+			}
+		}
+		for _, b := range nr.Behaviours {
+			if o, ok := oldB[b.Name]; !ok || !reflect.DeepEqual(o, b) {
+				e.behaviour[nr.Name] = append(e.behaviour[nr.Name], b)
 			}
 		}
 	}
@@ -234,6 +246,11 @@ func (e *explainer) explain(c Change) string {
 			}
 			return "new field " + strings.Join(added, ", ")
 		}
+	}
+	// Behaviours the intent changed (or added): stated in words, so the
+	// explanation is the behaviour, by name.
+	if why := e.byBehaviour(c, *nr, op); why != "" {
+		return why
 	}
 	// Who may write.
 	caller := c.Request.Caller
@@ -313,6 +330,111 @@ func (e *explainer) explain(c Change) string {
 		return why
 	}
 	return ""
+}
+
+// byBehaviour explains a difference by a behaviour the new intent added
+// or changed: an action's answer, a check's refusal (or a refusal it no
+// longer makes), or a computed field's value.
+func (e *explainer) byBehaviour(c Change, nr Resource, op string) string {
+	changed := e.behaviour[nr.Name]
+	if len(changed) == 0 {
+		return ""
+	}
+	name := func(b Behaviour) string {
+		if or := e.oldSpec.Named(nr.Name); or != nil {
+			for _, ob := range or.Behaviours {
+				if ob.Name == b.Name {
+					return "behaviour " + b.Name + " changed"
+				}
+			}
+		}
+		return "new behaviour " + b.Name
+	}
+	if action, ok := strings.CutPrefix(op, "action:"); ok {
+		for _, b := range changed {
+			if b.Name == action {
+				return name(b)
+			}
+		}
+	}
+	// A refusal that appeared or went away, on an operation a changed check runs on.
+	checkOp := op
+	if strings.HasPrefix(op, "action:") {
+		checkOp = "update" // actions run the update checks
+	}
+	if c.Old.Status != c.New.Status && (c.Old.Status >= 400 || c.New.Status >= 400) {
+		var names []string
+		for _, b := range changed {
+			if b.Checks(checkOp) {
+				names = append(names, name(b))
+			}
+		}
+		if len(names) > 0 {
+			return strings.Join(names, " or ")
+		}
+	}
+	// The same refusal, worded differently, on an operation a changed check
+	// runs on: the check's rule changed, so its wording may. (A refusal
+	// reworded when no rule changed stays unexplained: that's drift.)
+	if c.Old.Status == c.New.Status && c.New.Status >= 400 {
+		var names []string
+		for _, b := range changed {
+			if b.Checks(checkOp) {
+				names = append(names, name(b))
+			}
+		}
+		if len(names) > 0 {
+			return strings.Join(names, " or ") + " (its refusal reads differently)"
+		}
+	}
+	// The same answer except for fields a changed computed behaviour sets.
+	if c.Old.Status == c.New.Status {
+		fields, names := map[string]bool{}, []string{}
+		for _, b := range changed {
+			if b.Kind == "computed" {
+				fields[b.Field] = true
+				names = append(names, name(b))
+			}
+		}
+		if len(fields) > 0 && equalExcept(c.Old.Body, c.New.Body, fields) {
+			return strings.Join(names, " or ")
+		}
+	}
+	return ""
+}
+
+// equalExcept compares two response bodies, ignoring the given fields
+// wherever they appear in records.
+func equalExcept(a, b any, ignore map[string]bool) bool {
+	switch av := a.(type) {
+	case map[string]any:
+		bv, ok := b.(map[string]any)
+		if !ok {
+			return false
+		}
+		for k := range union(av, bv) {
+			if ignore[k] {
+				continue
+			}
+			if !equalExcept(av[k], bv[k], ignore) {
+				return false
+			}
+		}
+		return true
+	case []any:
+		bv, ok := b.([]any)
+		if !ok || len(av) != len(bv) {
+			return false
+		}
+		for i := range av {
+			if !equalExcept(av[i], bv[i], ignore) {
+				return false
+			}
+		}
+		return true
+	default:
+		return reflect.DeepEqual(a, b)
+	}
 }
 
 // track remembers records that now differ between versions because of an

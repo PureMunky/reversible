@@ -10,6 +10,11 @@
 // the locked-down pod). It can't draft specs from conversation, so it
 // rehearses cmd/incidents, which only asks for code.
 //
+// Behaviour code (factory.BehaviourCoder) is stated in words, so no
+// generator can write it: with -recordings, fakeclaude answers those
+// prompts with recorded model replies (model.Replayer), which is how
+// cmd/bookings is rehearsed.
+//
 //	go run ./cmd/fakeclaude -addr :8080
 //	ANTHROPIC_API_KEY=rehearsal ANTHROPIC_BASE_URL=http://localhost:8080 go run ./cmd/incidents
 //
@@ -24,15 +29,18 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 
 	"github.com/PureMunky/reversible/factory"
+	"github.com/PureMunky/reversible/model"
 )
 
 func main() {
 	addr := flag.String("addr", ":8080", "listen address")
 	flaky := flag.Int("flaky", 0, "fail this many requests first with 529 overloaded, to rehearse retries")
+	recordings := flag.String("recordings", "", "directory of recorded model replies (<key>.reply) to answer behaviour prompts with")
 	flag.Parse()
 	var mu sync.Mutex
 	failed := 0
@@ -65,6 +73,13 @@ func main() {
 			return
 		}
 		prompt := req.Messages[0].Content
+		if *recordings != "" {
+			if text, err := (model.Replayer{FS: os.DirFS(*recordings)}).Complete(r.Context(), req.System, prompt); err == nil {
+				log.Printf("answered with recording %s", model.RecordingKey(req.System, prompt))
+				reply(w, req.Model, text, len(req.System+prompt)/4)
+				return
+			}
+		}
 		if req.System != factory.CoderSystemPrompt {
 			apiError(w, 400, "invalid_request_error", "fakeclaude only rehearses coding requests (factory.ModelCoder); it can't draft specs from conversation")
 			return
@@ -80,14 +95,8 @@ func main() {
 			return
 		}
 		text := "```go\n" + files["main.go"] + "```\n"
-		in, out := len(req.System+prompt)/4, len(text)/4 // rough, for the usage line
-		log.Printf("wrote %s for spec %s (%s): ~%d in / ~%d out tokens", "main.go", spec.Hash(), spec.Service, in, out)
-		w.Header().Set("content-type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{
-			"type": "message", "role": "assistant", "model": req.Model, "stop_reason": "end_turn",
-			"content": []map[string]string{{"type": "text", "text": text}},
-			"usage":   map[string]int{"input_tokens": in, "output_tokens": out},
-		})
+		log.Printf("wrote main.go for spec %s (%s)", spec.Hash(), spec.Service)
+		reply(w, req.Model, text, len(req.System+prompt)/4)
 	})
 	log.Printf("fakeclaude: rehearsal stand-in for the Messages API on %s (no model, no cost)", *addr)
 	log.Fatal(http.ListenAndServe(*addr, nil))
@@ -106,6 +115,16 @@ func specIn(prompt string) (factory.ServiceSpec, error) {
 		return factory.ServiceSpec{}, fmt.Errorf("specification: %v", err)
 	}
 	return factory.ParseSpec(raw)
+}
+
+func reply(w http.ResponseWriter, model, text string, in int) {
+	out := len(text) / 4 // rough, for the usage line
+	w.Header().Set("content-type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"type": "message", "role": "assistant", "model": model, "stop_reason": "end_turn",
+		"content": []map[string]string{{"type": "text", "text": text}},
+		"usage":   map[string]int{"input_tokens": in, "output_tokens": out},
+	})
 }
 
 func apiError(w http.ResponseWriter, status int, typ, msg string) {

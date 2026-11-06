@@ -1,0 +1,591 @@
+{
+ "service": "bookings",
+ "purpose": "Appointment booking for a small business: what it offers, who booked what and when, what it costs, and cancellations with refunds. Customers book; the owner sets the menu.",
+ "owner": "maya",
+ "resources": [
+  {
+   "name": "service",
+   "plural": "services",
+   "key": "name",
+   "writers": [
+    "owner"
+   ],
+   "fields": [
+    {
+     "name": "name",
+     "type": "string",
+     "required": true,
+     "pattern": "^[a-z][a-z0-9-]*$"
+    },
+    {
+     "name": "minutes",
+     "type": "int",
+     "required": true,
+     "min": 15,
+     "max": 480,
+     "why": "how long an appointment takes"
+    },
+    {
+     "name": "price",
+     "type": "number",
+     "required": true,
+     "min": 0
+    }
+   ]
+  },
+  {
+   "name": "booking",
+   "plural": "bookings",
+   "key": "id",
+   "fields": [
+    {
+     "name": "id",
+     "type": "string",
+     "required": true,
+     "pattern": "^bk-[0-9]+$"
+    },
+    {
+     "name": "service",
+     "type": "string",
+     "required": true,
+     "references": "service",
+     "filterable": true
+    },
+    {
+     "name": "customer",
+     "type": "string",
+     "required": true
+    },
+    {
+     "name": "date",
+     "type": "string",
+     "required": true,
+     "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+     "filterable": true,
+     "why": "YYYY-MM-DD"
+    },
+    {
+     "name": "time",
+     "type": "string",
+     "required": true,
+     "pattern": "^[0-2][0-9]:[0-5][0-9]$",
+     "why": "HH:MM, 24-hour, the business's local time"
+    },
+    {
+     "name": "status",
+     "type": "string",
+     "enum": [
+      "confirmed",
+      "cancelled"
+     ],
+     "default": "confirmed",
+     "filterable": true,
+     "transitions": {
+      "confirmed": [
+       "cancelled"
+      ]
+     },
+     "why": "a cancelled booking stays cancelled; book again instead"
+    },
+    {
+     "name": "price",
+     "type": "number",
+     "computed": true
+    }
+   ],
+   "behaviours": [
+    {
+     "name": "booking_price",
+     "kind": "computed",
+     "field": "price",
+     "rule": "The booking's price is its service's price, plus a 25% surcharge when the booking's date falls on a Saturday or Sunday. Round to cents.",
+     "why": "weekend appointments cost more to staff"
+    },
+    {
+     "name": "no_double_booking",
+     "kind": "check",
+     "rule": "A confirmed booking may not overlap another confirmed booking on the same date. A booking occupies [time, time + its service's minutes). Bookings that only touch (one ends exactly when the next starts) don't overlap. Cancelled bookings never block. Refuse with 409, naming the booking it clashes with.",
+     "why": "one chair, one appointment at a time"
+    },
+    {
+     "name": "opening_hours",
+     "kind": "check",
+     "rule": "A confirmed booking must start no earlier than 09:00 and end no later than 17:00 (start time plus its service's minutes). Refuse with 400 and say the opening hours.",
+     "why": "the business is open 09:00 to 17:00"
+    },
+    {
+     "name": "cancel_booking",
+     "kind": "action",
+     "action": "cancel",
+     "rule": "Cancels a confirmed booking. The request body gives \"at\", the moment of cancellation as YYYY-MM-DDTHH:MM (local time); it's required (400 without it, or if it isn't in that form). If \"at\" is at least 24 hours before the booking's start, the refund is the full price; otherwise half the price, rounded to cents. Sets status to cancelled and answers {\"id\", \"status\", \"refund\"}. Cancelling a booking that's already cancelled is 409.",
+     "why": "late cancellations cost the business a slot it can't refill"
+    }
+   ]
+  }
+ ],
+ "examples": [
+  {
+   "name": "offer a haircut",
+   "request": {
+    "method": "POST",
+    "path": "/services",
+    "body": {
+     "name": "haircut",
+     "minutes": 60,
+     "price": 40
+    },
+    "caller": "owner"
+   },
+   "expect": {
+    "status": 201,
+    "body": {
+     "name": "haircut",
+     "minutes": 60,
+     "price": 40
+    }
+   }
+  },
+  {
+   "name": "offer colour",
+   "request": {
+    "method": "POST",
+    "path": "/services",
+    "body": {
+     "name": "colour",
+     "minutes": 120,
+     "price": 90
+    },
+    "caller": "owner"
+   },
+   "expect": {
+    "status": 201
+   }
+  },
+  {
+   "name": "only the owner sets the menu",
+   "request": {
+    "method": "POST",
+    "path": "/services",
+    "body": {
+     "name": "nails",
+     "minutes": 30,
+     "price": 20
+    },
+    "caller": "ana"
+   },
+   "expect": {
+    "status": 403
+   }
+  },
+  {
+   "name": "the menu",
+   "request": {
+    "method": "GET",
+    "path": "/services"
+   },
+   "expect": {
+    "status": 200,
+    "body": [
+     {
+      "name": "colour"
+     },
+     {
+      "name": "haircut"
+     }
+    ]
+   }
+  },
+  {
+   "name": "raise a price",
+   "request": {
+    "method": "PATCH",
+    "path": "/services/colour",
+    "body": {
+     "price": 95
+    },
+    "caller": "owner"
+   },
+   "expect": {
+    "status": 200,
+    "body": {
+     "price": 95
+    }
+   }
+  },
+  {
+   "name": "one service",
+   "request": {
+    "method": "GET",
+    "path": "/services/colour"
+   },
+   "expect": {
+    "status": 200,
+    "body": {
+     "minutes": 120,
+     "price": 95
+    }
+   }
+  },
+  {
+   "name": "a weekday booking costs the service price",
+   "request": {
+    "method": "POST",
+    "path": "/bookings",
+    "body": {
+     "id": "bk-1",
+     "service": "haircut",
+     "customer": "ana",
+     "date": "2026-06-10",
+     "time": "10:00"
+    },
+    "caller": "ana"
+   },
+   "expect": {
+    "status": 201,
+    "body": {
+     "id": "bk-1",
+     "price": 40,
+     "status": "confirmed"
+    }
+   },
+   "behaviour": "booking_price"
+  },
+  {
+   "name": "a weekend booking costs 25% more",
+   "request": {
+    "method": "POST",
+    "path": "/bookings",
+    "body": {
+     "id": "bk-2",
+     "service": "haircut",
+     "customer": "ben",
+     "date": "2026-06-13",
+     "time": "10:00"
+    },
+    "caller": "ben"
+   },
+   "expect": {
+    "status": 201,
+    "body": {
+     "price": 50
+    }
+   },
+   "behaviour": "booking_price"
+  },
+  {
+   "name": "callers can't set the price",
+   "request": {
+    "method": "POST",
+    "path": "/bookings",
+    "body": {
+     "id": "bk-9",
+     "service": "haircut",
+     "customer": "cy",
+     "date": "2026-06-10",
+     "time": "14:00",
+     "price": 1
+    },
+    "caller": "cy"
+   },
+   "expect": {
+    "status": 400
+   },
+   "behaviour": "booking_price"
+  },
+  {
+   "name": "an overlapping booking is refused",
+   "request": {
+    "method": "POST",
+    "path": "/bookings",
+    "body": {
+     "id": "bk-3",
+     "service": "colour",
+     "customer": "cy",
+     "date": "2026-06-10",
+     "time": "09:30"
+    },
+    "caller": "cy"
+   },
+   "expect": {
+    "status": 409
+   },
+   "behaviour": "no_double_booking"
+  },
+  {
+   "name": "back to back is fine",
+   "request": {
+    "method": "POST",
+    "path": "/bookings",
+    "body": {
+     "id": "bk-3",
+     "service": "haircut",
+     "customer": "cy",
+     "date": "2026-06-10",
+     "time": "11:00"
+    },
+    "caller": "cy"
+   },
+   "expect": {
+    "status": 201,
+    "body": {
+     "price": 40
+    }
+   },
+   "behaviour": "no_double_booking"
+  },
+  {
+   "name": "can't run past closing",
+   "request": {
+    "method": "POST",
+    "path": "/bookings",
+    "body": {
+     "id": "bk-4",
+     "service": "colour",
+     "customer": "di",
+     "date": "2026-06-10",
+     "time": "16:00"
+    },
+    "caller": "di"
+   },
+   "expect": {
+    "status": 400
+   },
+   "behaviour": "opening_hours"
+  },
+  {
+   "name": "can't start before opening",
+   "request": {
+    "method": "POST",
+    "path": "/bookings",
+    "body": {
+     "id": "bk-4",
+     "service": "haircut",
+     "customer": "di",
+     "date": "2026-06-10",
+     "time": "08:30"
+    },
+    "caller": "di"
+   },
+   "expect": {
+    "status": 400
+   },
+   "behaviour": "opening_hours"
+  },
+  {
+   "name": "ending exactly at closing is fine",
+   "request": {
+    "method": "POST",
+    "path": "/bookings",
+    "body": {
+     "id": "bk-4",
+     "service": "colour",
+     "customer": "di",
+     "date": "2026-06-10",
+     "time": "15:00"
+    },
+    "caller": "di"
+   },
+   "expect": {
+    "status": 201,
+    "body": {
+     "price": 95
+    }
+   },
+   "behaviour": "opening_hours"
+  },
+  {
+   "name": "moving into a clash is refused",
+   "request": {
+    "method": "PATCH",
+    "path": "/bookings/bk-3",
+    "body": {
+     "time": "10:30"
+    },
+    "caller": "cy"
+   },
+   "expect": {
+    "status": 409
+   },
+   "behaviour": "no_double_booking"
+  },
+  {
+   "name": "moving to a free slot is fine",
+   "request": {
+    "method": "PATCH",
+    "path": "/bookings/bk-3",
+    "body": {
+     "time": "12:00"
+    },
+    "caller": "cy"
+   },
+   "expect": {
+    "status": 200,
+    "body": {
+     "time": "12:00",
+     "price": 40
+    }
+   },
+   "behaviour": "no_double_booking"
+  },
+  {
+   "name": "the day's bookings",
+   "request": {
+    "method": "GET",
+    "path": "/bookings?date=2026-06-10"
+   },
+   "expect": {
+    "status": 200,
+    "body": [
+     {
+      "id": "bk-1"
+     },
+     {
+      "id": "bk-3"
+     },
+     {
+      "id": "bk-4"
+     }
+    ]
+   }
+  },
+  {
+   "name": "cancel early: full refund",
+   "request": {
+    "method": "POST",
+    "path": "/bookings/bk-1/cancel",
+    "body": {
+     "at": "2026-06-08T10:00"
+    },
+    "caller": "ana"
+   },
+   "expect": {
+    "status": 200,
+    "body": {
+     "id": "bk-1",
+     "status": "cancelled",
+     "refund": 40
+    }
+   },
+   "behaviour": "cancel_booking"
+  },
+  {
+   "name": "cancel late: half refund",
+   "request": {
+    "method": "POST",
+    "path": "/bookings/bk-2/cancel",
+    "body": {
+     "at": "2026-06-13T08:00"
+    },
+    "caller": "ben"
+   },
+   "expect": {
+    "status": 200,
+    "body": {
+     "status": "cancelled",
+     "refund": 25
+    }
+   },
+   "behaviour": "cancel_booking"
+  },
+  {
+   "name": "can't cancel twice",
+   "request": {
+    "method": "POST",
+    "path": "/bookings/bk-2/cancel",
+    "body": {
+     "at": "2026-06-13T08:30"
+    },
+    "caller": "ben"
+   },
+   "expect": {
+    "status": 409
+   },
+   "behaviour": "cancel_booking"
+  },
+  {
+   "name": "cancelling needs a time",
+   "request": {
+    "method": "POST",
+    "path": "/bookings/bk-3/cancel",
+    "body": {},
+    "caller": "cy"
+   },
+   "expect": {
+    "status": 400
+   },
+   "behaviour": "cancel_booking"
+  },
+  {
+   "name": "a cancelled booking frees its slot",
+   "request": {
+    "method": "POST",
+    "path": "/bookings",
+    "body": {
+     "id": "bk-5",
+     "service": "colour",
+     "customer": "eve",
+     "date": "2026-06-10",
+     "time": "09:00"
+    },
+    "caller": "eve"
+   },
+   "expect": {
+    "status": 201,
+    "body": {
+     "price": 95
+    }
+   },
+   "behaviour": "no_double_booking"
+  },
+  {
+   "name": "cancelled is final",
+   "request": {
+    "method": "PATCH",
+    "path": "/bookings/bk-1",
+    "body": {
+     "status": "confirmed"
+    },
+    "caller": "ana"
+   },
+   "expect": {
+    "status": 409
+   }
+  },
+  {
+   "name": "read a booking",
+   "request": {
+    "method": "GET",
+    "path": "/bookings/bk-1"
+   },
+   "expect": {
+    "status": 200,
+    "body": {
+     "status": "cancelled",
+     "price": 40
+    }
+   }
+  },
+  {
+   "name": "clear out a cancelled booking",
+   "request": {
+    "method": "DELETE",
+    "path": "/bookings/bk-2",
+    "caller": "ben"
+   },
+   "expect": {
+    "status": 204
+   }
+  },
+  {
+   "name": "a service in use can't be removed",
+   "request": {
+    "method": "DELETE",
+    "path": "/services/haircut",
+    "caller": "owner"
+   },
+   "expect": {
+    "status": 409
+   }
+  }
+ ]
+}

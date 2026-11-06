@@ -4,7 +4,7 @@
 #   deploy/kind/run.sh up                # cluster, image, namespace, network rules, model gateway
 #   deploy/kind/run.sh check             # prove the network rules are enforced here
 #   deploy/kind/run.sh offline [demo]    # deterministic coder, no network: the baseline
-#   deploy/kind/run.sh rehearse          # the live path, through the gateway, to a stand-in API: no key, no cost
+#   deploy/kind/run.sh rehearse [demo]   # the live path, through the gateway, to a stand-in API: no key, no cost
 #   deploy/kind/run.sh key               # store your Anthropic key for the model gateway (input hidden)
 #   deploy/kind/run.sh live [demo]       # Claude writes the code (incidents) or the spec and code (factory)
 #   deploy/kind/run.sh open              # port-forward the running demo to localhost:8080
@@ -12,7 +12,7 @@
 #   deploy/kind/run.sh dashboards        # port-forward Grafana (localhost:3000) and Prometheus (:9090)
 #   deploy/kind/run.sh logs | status | forget-key | down
 #
-# demo is incidents (default) or factory. Set REVERSIBLE_MODEL to choose a
+# demo is incidents (default), bookings or factory. Set REVERSIBLE_MODEL to choose a
 # model for live runs (REVERSIBLE_MAX_TOKENS for longer replies),
 # GATEWAY_MAX_CALLS / GATEWAY_MAX_OUTPUT_TOKENS for a run's budget,
 # LOCAL_PORT for open, YES=1 to skip the live prompt.
@@ -111,7 +111,7 @@ gateway_url() { echo "http://$(k get svc model-gateway -o jsonpath='{.spec.clust
 # run_demo NAME MODE NETWORK DEMO ENVKIND ENVNAME [GATEWAY_URL]
 run_demo() {
   local name=$1 mode=$2 net=$3 demo=$4 envkind=$5 envname=$6 gwurl=${7:-}
-  case "$demo" in incidents|factory) ;; *) echo "demo is incidents or factory" >&2; exit 1 ;; esac
+  case "$demo" in incidents|factory|bookings) ;; *) echo "demo is incidents, bookings or factory" >&2; exit 1 ;; esac
   k delete job -l app.kubernetes.io/name=reversible-demo --ignore-not-found --wait >/dev/null
   sed -e "s/__NAME__/$name/g" -e "s/__MODE__/$mode/g" -e "s/__NETWORK__/$net/g" -e "s/__DEMO__/$demo/g" \
       -e "s/__ENVKIND__/$envkind/g" -e "s/__ENVNAME__/$envname/g" -e "s#__GATEWAY_URL__#$gwurl#g" -e "s/__MODEL__/${REVERSIBLE_MODEL:-}/g" -e "s/__MAXTOKENS__/${REVERSIBLE_MAX_TOKENS:-}/g" \
@@ -165,12 +165,12 @@ offline() { run_demo "${1:-incidents}-offline" offline none "${1:-incidents}" co
 
 rehearse() {
   local demo=${1:-incidents}
-  if [ "$demo" != incidents ]; then
-    echo "The rehearsal stand-in only writes code; the factory demo also needs a model to draft specs from conversation. Rehearse incidents." >&2
+  if [ "$demo" = factory ]; then
+    echo "The rehearsal stand-in writes code (and replays recorded behaviour code); the factory demo also needs a model to draft specs from conversation. Rehearse incidents or bookings." >&2
     exit 1
   fi
   gateway rehearsal
-  run_demo incidents-rehearsal rehearsal model incidents secretRef gateway-token "$(gateway_url)"
+  run_demo "$demo-rehearsal" rehearsal model "$demo" secretRef gateway-token "$(gateway_url)"
 }
 
 key() {
@@ -196,6 +196,8 @@ live() {
     echo "writes runs in a sandbox container with no key, no token, no cluster credentials and no route out."
     if [ "$demo" = incidents ]; then
       echo "Expect 3 to 9 calls (3 builds, up to 3 attempts each)."
+    elif [ "$demo" = bookings ]; then
+      echo "Expect 2 to 6 calls: Claude writes the behaviours (logic stated in words) for 2 builds, up to 3 attempts each."
     else
       echo "Expect 5 to 12 calls (2 spec drafts, 3 builds of up to 3 attempts each)."
     fi

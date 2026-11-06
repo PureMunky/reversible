@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -124,5 +125,31 @@ func TestExtractJSON(t *testing.T) {
 	}
 	if _, err := ExtractJSON(`{"open": [`); err == nil {
 		t.Error("expected unterminated error")
+	}
+}
+
+func TestRecordThenReplay(t *testing.T) {
+	dir := t.TempDir()
+	calls := 0
+	live := Func(func(_ context.Context, system, prompt string) (string, error) {
+		calls++
+		return "reply to " + prompt, nil
+	})
+	rec := Recorder{Model: live, Dir: dir}
+	if out, err := rec.Complete(context.Background(), "sys", "a"); err != nil || out != "reply to a" {
+		t.Fatalf("record: %q %v", out, err)
+	}
+	rep := Replayer{FS: os.DirFS(dir)}
+	if out, err := rep.Complete(context.Background(), "sys", "a"); err != nil || out != "reply to a" {
+		t.Fatalf("replay: %q %v", out, err)
+	}
+	if _, err := rep.Complete(context.Background(), "sys", "b"); !errors.Is(err, ErrNotRecorded) {
+		t.Fatalf("a different prompt must not be answered: %v", err)
+	}
+	if _, err := rep.Complete(context.Background(), "other system", "a"); !errors.Is(err, ErrNotRecorded) {
+		t.Fatalf("a different system prompt must not be answered: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("live model called %d times", calls)
 	}
 }

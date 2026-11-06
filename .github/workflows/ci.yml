@@ -65,6 +65,20 @@ jobs:
           go run ./cmd/factory -faulty-coder | tee faulty.txt
           grep -q "UNEXPLAINED" faulty.txt
           grep -q "Phil does NOT sign off" faulty.txt
+          go run ./cmd/bookings | tee bookings.txt
+          grep -q "4 behaviours stated in words" bookings.txt
+          grep -q "The deterministic generator, alone: this spec has behaviours" bookings.txt
+          grep -q "26/26 examples pass" bookings.txt
+          grep -q "27/27 examples pass" bookings.txt
+          (! grep -q "UNEXPLAINED" bookings.txt)
+          grep -q "behaviour opening_hours changed" bookings.txt
+          grep -q "behaviour cancel_booking changed" bookings.txt
+          grep -q 'refund":0' bookings.txt
+          grep -q "promoted e3be6c74e6e9" bookings.txt
+          grep -q "cause: behaviour opening_hours changed" bookings.txt
+          grep -q "written or edited by a person: 0" bookings.txt
+          grep -q "chain verifies" bookings.txt
+          (! pgrep -f "bookings-demo-.*/service")
           go run ./cmd/incidents | tee incidents.txt
           grep -q "2 resources (services, incidents), 18 examples; the spec checker has 0 question(s)" incidents.txt
           grep -q "18/18 examples pass" incidents.txt
@@ -169,6 +183,14 @@ jobs:
           kubectl --context kind-reversible -n reversible exec job/incidents-rehearsal -c factory -- wget -qO- http://127.0.0.1:8080/metrics > rmetrics.txt
           grep -q 'reversible_service_starts_total{where="sandbox"}' rmetrics.txt
           (! grep -q 'reversible_service_starts_total{where="local"}' rmetrics.txt)
+      - name: rehearsal of behaviour code (bookings)
+        run: |
+          deploy/kind/run.sh rehearse bookings | tee rehearse-bookings.txt
+          grep -q "26/26 examples pass" rehearse-bookings.txt
+          grep -q "27/27 examples pass" rehearse-bookings.txt
+          grep -q "behaviour code written by the model" rehearse-bookings.txt
+          grep -q "Sandbox checked: generated code can't see" rehearse-bookings.txt
+          kubectl --context kind-reversible -n reversible logs deploy/fakeclaude | grep -q "answered with recording"
       - name: diagnostics
         if: failure()
         run: |
