@@ -174,6 +174,12 @@ func Propose(f Finding, live ServiceSpec) Proposal {
 	}
 	t := f.Requests[0]
 	p := Proposal{Finding: f}
+	res, _ := live.Route(t.Request)
+	if res == nil {
+		p.Question = fmt.Sprintf("Since release %s, %s %s isn't an endpoint of the intent. What should it do?", f.Since, t.Request.Method, t.Request.Path)
+		return p
+	}
+	idx := resourceIndex(live, res.Name)
 
 	switch f.Kind {
 	case ServerError:
@@ -181,55 +187,150 @@ func Propose(f Finding, live ServiceSpec) Proposal {
 			f.Since, who, f.Count, t.Request.Method, t.Request.Path)
 		if f.Previous[0].Status != 0 && f.Previous[0].Status < 500 {
 			s := clone(live)
-			s.Examples = append(s.Examples, capture(live, t.Request, "", f.Previous[0].Status, fmt.Sprintf("production: %s %s must not fail", t.Request.Method, t.Request.Path))...)
+			s.Examples = append(s.Examples, capture(live, t.Request, nil, f.Previous[0].Status, fmt.Sprintf("production: %s %s must not fail", t.Request.Method, t.Request.Path))...)
 			p.Options = append(p.Options, Option{Label: fmt.Sprintf("it's a defect: answer %d, as the previous version did", f.Previous[0].Status), Spec: s})
 		}
 
 	case NewRefusal:
-		ri := ruleBehind(live, f.Because)
 		p.Question = fmt.Sprintf("Since release %s, %s has had %d request(s) refused that the previous version accepted (e.g. %s %s → %d)",
 			f.Since, who, f.Count, t.Request.Method, t.Request.Path, t.Response.Status)
 		if f.Because != "" {
 			p.Question += ", because of the " + f.Because
 		}
 		p.Question += ". What should happen?"
+		prev := f.Previous[0].Status
 
-		cond := ""
+		// What state the record must be in to reproduce the refusal.
+		setup := map[string]any{}
+		ri := ruleBehind(*res, f.Because)
 		if ri >= 0 {
-			c := live.Resource.Rules[ri].ForbidDeleteWhen
-			cond = c.Field + "=" + fmt.Sprint(c.Equals)
+			c := res.Rules[ri].ForbidDeleteWhen
+			setup[c.Field] = c.Equals
 		}
+		field, from, to, isTransition := transitionRefused(*res, t)
+		if isTransition {
+			setup[field] = from
+		}
+
 		keep := clone(live)
-		keep.Examples = append(keep.Examples, capture(live, t.Request, cond, t.Response.Status, fmt.Sprintf("production: %s is still refused", who))...)
+		keep.Examples = append(keep.Examples, capture(live, t.Request, setup, t.Response.Status, fmt.Sprintf("production: %s is still refused", who))...)
 		p.Options = append(p.Options, Option{Label: fmt.Sprintf("keep refusing; %s must change", who), Spec: keep})
 
-		if ri >= 0 && f.Caller != "" {
-			ex := clone(live)
-			ex.Resource.Rules[ri].ExceptCallers = append(ex.Resource.Rules[ri].ExceptCallers, f.Caller)
-			ex.Examples = append(ex.Examples, capture(live, t.Request, cond, f.Previous[0].Status, fmt.Sprintf("production: %s is exempt", who))...)
-			p.Options = append(p.Options, Option{Label: fmt.Sprintf("exempt %s from the rule", who), Spec: ex})
-		}
-		if ri >= 0 {
+		switch {
+		case ri >= 0:
+			if f.Caller != "" {
+				ex := clone(live)
+				rr := ex.All()[idx]
+				rr.Rules[ri].ExceptCallers = append(rr.Rules[ri].ExceptCallers, f.Caller)
+				ex.Examples = append(ex.Examples, capture(live, t.Request, setup, prev, fmt.Sprintf("production: %s is exempt", who))...)
+				p.Options = append(p.Options, Option{Label: fmt.Sprintf("exempt %s from the rule", who), Spec: ex})
+			}
 			drop := clone(live)
-			drop.Resource.Rules = append(drop.Resource.Rules[:ri:ri], drop.Resource.Rules[ri+1:]...)
+			rr := drop.All()[idx]
+			rr.Rules = append(rr.Rules[:ri:ri], rr.Rules[ri+1:]...)
+			drop.Examples = append(without(drop, res.Name, "delete", 409), capture(live, t.Request, setup, prev, fmt.Sprintf("production: %s is allowed again", who))...)
+			p.Options = append(p.Options, Option{Label: "drop the rule for everyone", Spec: drop})
+
+		case t.Response.Status == 403 && len(res.Writers) > 0 && f.Caller != "":
+			add := clone(live)
+			rr := add.All()[idx]
+			rr.Writers = append(rr.Writers, f.Caller)
+			add.Examples = append(withoutCaller(add, res.Name, f.Caller, 403), capture(live, t.Request, setup, prev, fmt.Sprintf("production: %s may change %s", who, res.Plural))...)
+			p.Options = append(p.Options, Option{Label: fmt.Sprintf("let %s change %s", who, res.Plural), Spec: add})
+			open := clone(live)
+			open.All()[idx].Writers = nil
+			ex := without(open, res.Name, "", 403)
+			open.Examples = append(ex, capture(live, t.Request, setup, prev, fmt.Sprintf("production: anyone may change %s", res.Plural))...)
+			p.Options = append(p.Options, Option{Label: fmt.Sprintf("let anyone change %s", res.Plural), Spec: open})
+
+		case isTransition:
+			allow := clone(live)
+			for i := range allow.All()[idx].Fields {
+				fl := &allow.All()[idx].Fields[i]
+				if fl.Name == field {
+					tr := map[string][]string{}
+					for k, v := range fl.Transitions {
+						tr[k] = append([]string(nil), v...)
+					}
+					tr[from] = append(tr[from], to)
+					fl.Transitions = tr
+				}
+			}
 			var kept []Example
-			for _, e := range drop.Examples {
-				if endpointOf(drop.Resource, e.Request) == "delete" && e.Expect.Status == 409 {
-					continue // this example only existed to show the rule
+			for _, e := range allow.Examples {
+				r, eop := allow.Route(e.Request)
+				b, _ := e.Request.Body.(map[string]any)
+				if r != nil && r.Name == res.Name && eop == "update" && e.Expect.Status == 409 && b[field] == to {
+					continue // showed the refusal now being allowed
 				}
 				kept = append(kept, e)
 			}
-			drop.Examples = append(kept, capture(live, t.Request, cond, f.Previous[0].Status, fmt.Sprintf("production: %s is allowed again", who))...)
-			p.Options = append(p.Options, Option{Label: "drop the rule for everyone", Spec: drop})
+			allow.Examples = append(kept, capture(live, t.Request, setup, prev, fmt.Sprintf("production: %s may go from %s to %s", field, from, to))...)
+			p.Options = append(p.Options, Option{Label: fmt.Sprintf("allow %s to go from %s to %s", field, from, to), Spec: allow})
 		}
 	}
 	return p
 }
 
-// ruleBehind finds the rule an explanation names, or -1.
-func ruleBehind(s ServiceSpec, because string) int {
-	for i, r := range s.Resource.Rules {
-		if c := r.ForbidDeleteWhen; c != nil && strings.Contains(because, fmt.Sprintf("no delete while %s is %v", c.Field, c.Equals)) {
+func resourceIndex(s ServiceSpec, name string) int {
+	for i, r := range s.All() {
+		if r.Name == name {
+			return i
+		}
+	}
+	return -1
+}
+
+// without drops examples on a resource's operation ("" for any) that
+// expect a status: examples that only existed to show a rule being dropped.
+func without(s ServiceSpec, res, op string, status int) []Example {
+	var kept []Example
+	for _, e := range s.Examples {
+		r, eop := s.Route(e.Request)
+		if r != nil && r.Name == res && (op == "" || eop == op) && e.Expect.Status == status {
+			continue
+		}
+		kept = append(kept, e)
+	}
+	return kept
+}
+
+// withoutCaller drops examples showing a caller refused with a status on
+// a resource: the answer just changed what that caller may do.
+func withoutCaller(s ServiceSpec, res, caller string, status int) []Example {
+	var kept []Example
+	for _, e := range s.Examples {
+		if r, _ := s.Route(e.Request); r != nil && r.Name == res && e.Request.Caller == caller && e.Expect.Status == status {
+			continue
+		}
+		kept = append(kept, e)
+	}
+	return kept
+}
+
+// transitionRefused reads a refused state change from the response.
+func transitionRefused(r Resource, t Exchange) (field, from, to string, ok bool) {
+	if t.Response.Status != 409 || t.Request.Method != "PATCH" {
+		return "", "", "", false
+	}
+	m, _ := t.Response.Body.(map[string]any)
+	msg, _ := m["error"].(string)
+	for _, f := range r.Fields {
+		if len(f.Transitions) == 0 {
+			continue
+		}
+		var a, b string
+		if n, _ := fmt.Sscanf(msg, f.Name+" can't change from %s to %s", &a, &b); n == 2 {
+			return f.Name, a, strings.TrimRight(b, ".)"), true
+		}
+	}
+	return "", "", "", false
+}
+
+// ruleBehind finds the delete rule an explanation names, or -1.
+func ruleBehind(r Resource, because string) int {
+	for i, rule := range r.Rules {
+		if c := rule.ForbidDeleteWhen; c != nil && strings.Contains(because, fmt.Sprintf("no delete while %s is %v", c.Field, c.Equals)) {
 			return i
 		}
 	}
@@ -237,56 +338,66 @@ func ruleBehind(s ServiceSpec, because string) int {
 }
 
 // capture turns a production request into examples that reproduce it on
-// a fresh instance: a setup step that creates the record it acts on (in
-// the state the rule cares about), then the request itself.
-func capture(s ServiceSpec, req HTTPCall, cond string, status int, name string) []Example {
-	r := s.Resource
-	key := strings.TrimPrefix(req.Path, "/"+r.Plural+"/")
-	if key == req.Path || strings.Contains(key, "/") {
+// a fresh instance: setup steps that create the record it acts on (in the
+// state that matters, with any records it references), then the request.
+func capture(s ServiceSpec, req HTTPCall, state map[string]any, status int, name string) []Example {
+	r, op := s.Route(req)
+	if r == nil || op == "create" || op == "list" {
 		return []Example{{Name: name, Request: req, Expect: Expectancy{Status: status}}}
 	}
+	key := r.KeyOf(req)
 	// Keep the production key: the defect may depend on it. Rename only if
 	// the spec's examples already use that key.
 	fresh := key
 	for _, e := range s.Examples {
-		if strings.HasSuffix(e.Request.Path, "/"+key) {
-			fresh = "prod-" + key
-		}
-		if m, ok := e.Request.Body.(map[string]any); ok && m[r.Key] == key {
+		if er, _ := s.Route(e.Request); er != nil && er.Name == r.Name && er.KeyOf(e.Request) == key {
 			fresh = "prod-" + key
 		}
 	}
-	body := map[string]any{r.Key: fresh}
-	for _, f := range r.Fields {
-		if f.Required && f.Name != r.Key {
-			switch f.Type {
-			case "string":
-				body[f.Name] = "production"
-			case "bool":
-				body[f.Name] = false
-			default:
-				body[f.Name] = float64(0)
-			}
-		}
-	}
-	if field, val, ok := strings.Cut(cond, "="); ok {
-		for _, f := range r.Fields {
-			if f.Name == field {
-				switch f.Type {
-				case "bool":
-					body[field] = val == "true"
-				case "string":
-					body[field] = val
-				}
-			}
-		}
-	}
+	setup := setupFor(s, *r, fresh, state, name, 0)
 	replay := req
 	replay.Path = "/" + r.Plural + "/" + fresh
-	return []Example{
-		{Name: name + " (setup)", Request: HTTPCall{Method: "POST", Path: "/" + r.Plural, Body: body}, Expect: Expectancy{Status: 201}},
-		{Name: name, Request: replay, Expect: Expectancy{Status: status}},
+	return append(setup, Example{Name: name, Request: replay, Expect: Expectancy{Status: status}})
+}
+
+// setupFor creates a record (and, first, any records it must reference).
+func setupFor(s ServiceSpec, r Resource, key string, state map[string]any, name string, depth int) []Example {
+	var out []Example
+	body := map[string]any{r.Key: key}
+	for _, f := range r.Fields {
+		if !f.Required || f.Name == r.Key {
+			continue
+		}
+		switch {
+		case f.References != "":
+			if ref := s.Named(f.References); ref != nil && depth < 3 {
+				parent := sampleKey(s, *ref, "prod-"+ref.Name+"-"+strings.ToLower(key))
+				out = append(out, setupFor(s, *ref, parent, nil, name, depth+1)...)
+				body[f.Name] = parent
+			}
+		case len(f.Enum) > 0:
+			body[f.Name] = f.Enum[0]
+		case f.Type == "string":
+			body[f.Name] = "production"
+		case f.Type == "bool":
+			body[f.Name] = false
+		default:
+			v := 0.0
+			if f.Min != nil {
+				v = *f.Min
+			}
+			body[f.Name] = v
+		}
 	}
+	for k, v := range state {
+		body[k] = v
+	}
+	caller := ""
+	if len(r.Writers) > 0 {
+		caller = r.Writers[0]
+	}
+	return append(out, Example{Name: name + " (setup " + r.Name + ")", Request: HTTPCall{Method: "POST", Path: "/" + r.Plural, Body: body, Caller: caller},
+		Expect: Expectancy{Status: 201}})
 }
 
 func clone(s ServiceSpec) ServiceSpec {

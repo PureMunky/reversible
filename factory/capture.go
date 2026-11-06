@@ -37,17 +37,26 @@ func Capture(ctx context.Context, m model.Completer, conversation []Turn, curren
 		return Captured{}, errors.New("capture needs a model")
 	}
 	var b strings.Builder
-	b.WriteString("SPEC FORMAT (fields: string, bool, int, number; rules: forbid_delete_when, optionally except_callers; a request may name its caller; examples run in order against a fresh instance and are the contract)\n")
+	b.WriteString("SPEC FORMAT (one or more resources; fields: string, bool, int, number, with optional pattern, enum, min/max, default, references (another resource's key), filterable (GET /plural?field=value), transitions (allowed changes of an enum field); per resource: writers (callers allowed to change it; anyone may read) and rules (forbid_delete_when, optionally except_callers); a request may name its caller; examples run in order against a fresh instance and are the contract)\n")
 	if current != nil {
 		b.WriteString("CURRENT SPECIFICATION\n" + current.JSON() + "\n")
 	} else {
 		example, _ := json.MarshalIndent(ServiceSpec{
 			Service: "name", Purpose: "what it is for and who uses it", Owner: "accountable person",
-			Resource: Resource{Name: "item", Plural: "items", Key: "id",
-				Fields: []Field{{Name: "id", Type: "string", Required: true, Pattern: "^[a-z0-9-]+$"}, {Name: "done", Type: "bool", Default: false}},
-				Rules:  []Rule{{ForbidDeleteWhen: &Condition{Field: "done", Equals: false}, Why: "why the rule exists"}}},
-			Examples: []Example{{Name: "create", Request: HTTPCall{Method: "POST", Path: "/items", Body: map[string]any{"id": "a"}},
-				Expect: Expectancy{Status: 201, Body: map[string]any{"id": "a", "done": false}}}},
+			Resources: []Resource{
+				{Name: "project", Plural: "projects", Key: "id", Writers: []string{"leads"},
+					Fields: []Field{{Name: "id", Type: "string", Required: true, Pattern: "^[a-z0-9-]+$"}}},
+				{Name: "item", Plural: "items", Key: "id",
+					Fields: []Field{
+						{Name: "id", Type: "string", Required: true, Pattern: "^[a-z0-9-]+$"},
+						{Name: "project", Type: "string", Required: true, References: "project", Filterable: true},
+						{Name: "state", Type: "string", Enum: []string{"todo", "doing", "done"}, Default: "todo", Filterable: true,
+							Transitions: map[string][]string{"todo": {"doing"}, "doing": {"done", "todo"}}},
+					},
+					Rules: []Rule{{ForbidDeleteWhen: &Condition{Field: "state", Equals: "doing"}, Why: "why the rule exists"}}},
+			},
+			Examples: []Example{{Name: "create", Request: HTTPCall{Method: "POST", Path: "/projects", Body: map[string]any{"id": "a"}, Caller: "leads"},
+				Expect: Expectancy{Status: 201, Body: map[string]any{"id": "a"}}}},
 		}, "", "  ")
 		b.WriteString("EXAMPLE OF THE FORMAT\n" + string(example) + "\n")
 	}

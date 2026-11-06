@@ -45,7 +45,7 @@ jobs:
           grep -q "9/9 examples pass" factory.txt
           grep -q "12/12 examples pass" factory.txt
           grep -q "Phil signs off on that reality" factory.txt
-          ! grep -q "UNEXPLAINED" factory.txt
+          (! grep -q "UNEXPLAINED" factory.txt)  # subshell: a bare `!` never fails a `set -e` script
           grep -q "cached: intent unchanged" factory.txt
           grep -q "written or edited by a person: 0" factory.txt
           grep -q "chain verifies" factory.txt
@@ -61,10 +61,26 @@ jobs:
           grep -q "v1 serves everything" brittle.txt
           go run ./cmd/factory -show-prompts | tee prompts.txt
           grep -q "what the model would be sent (not sent: -show-prompts)" prompts.txt
-          ! pgrep -f "factory-demo-.*/service"
+          (! pgrep -f "factory-demo-.*/service")  # subshell: a bare `!` never fails a `set -e` script
           go run ./cmd/factory -faulty-coder | tee faulty.txt
           grep -q "UNEXPLAINED" faulty.txt
           grep -q "Phil does NOT sign off" faulty.txt
+          go run ./cmd/incidents | tee incidents.txt
+          grep -q "2 resources (services, incidents), 18 examples; the spec checker has 0 question(s)" incidents.txt
+          grep -q "18/18 examples pass" incidents.txt
+          grep -q "22/22 examples pass" incidents.txt
+          grep -q "27/27 examples pass" incidents.txt
+          (! grep -q "UNEXPLAINED" incidents.txt)  # subshell: a bare `!` never fails a `set -e` script
+          grep -q "new access rule: only on-call may change incidents" incidents.txt
+          grep -q "rules for incident.status changed" incidents.txt
+          grep -q "each keeps the other's fields" incidents.txt
+          grep -q "→ 2. let status-page-bot change incidents" incidents.txt
+          grep -q "→ 1. keep refusing; on-call must change" incidents.txt
+          grep -q "status-page-bot may now change incidents" incidents.txt
+          grep -q "no new findings" incidents.txt
+          grep -q "written or edited by a person: 0" incidents.txt
+          grep -q "chain verifies" incidents.txt
+          (! pgrep -f "incidents-demo-.*/service")  # subshell: a bare `!` never fails a `set -e` script
       - name: crash-recovery smoke test
         run: |
           go build -o agentctl ./cmd/agentctl

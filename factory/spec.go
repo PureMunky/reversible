@@ -26,23 +26,28 @@ import (
 // ServiceSpec is the intent for a service: what it manages, the rules it
 // must enforce, and examples of exactly how it should behave.
 type ServiceSpec struct {
-	Service  string    `json:"service"`
-	Purpose  string    `json:"purpose"`
-	Owner    string    `json:"owner,omitempty"`
-	Resource Resource  `json:"resource"`
-	Examples []Example `json:"examples"`
+	Service string `json:"service"`
+	Purpose string `json:"purpose"`
+	Owner   string `json:"owner,omitempty"`
+	// A service manages one resource (Resource) or several (Resources).
+	Resource  *Resource  `json:"resource,omitempty"`
+	Resources []Resource `json:"resources,omitempty"`
+	Examples  []Example  `json:"examples"`
 }
 
-// Resource is the thing the service manages.
+// Resource is a kind of thing the service manages.
 type Resource struct {
 	Name   string  `json:"name"`   // singular, e.g. "flag"
 	Plural string  `json:"plural"` // URL segment, e.g. "flags"
 	Key    string  `json:"key"`    // identifying field
 	Fields []Field `json:"fields"`
 	Rules  []Rule  `json:"rules,omitempty"`
+	// Writers are the callers (by X-Caller) allowed to create, update and
+	// delete; anyone may read. Empty means anyone may write.
+	Writers []string `json:"writers,omitempty"`
 }
 
-// Field is one property of the resource.
+// Field is one property of a resource.
 type Field struct {
 	Name     string   `json:"name"`
 	Type     string   `json:"type"` // string, bool, int, number
@@ -52,7 +57,15 @@ type Field struct {
 	Enum     []string `json:"enum,omitempty"`    // strings
 	Min      *float64 `json:"min,omitempty"`     // int, number
 	Max      *float64 `json:"max,omitempty"`     // int, number
-	Why      string   `json:"why,omitempty"`
+	// References names another resource: the field holds that resource's
+	// key, it must exist, and it can't be deleted while referenced.
+	References string `json:"references,omitempty"`
+	// Filterable fields can be used to filter the list: GET /plural?field=value.
+	Filterable bool `json:"filterable,omitempty"`
+	// Transitions restricts how an enum field may change: from each state,
+	// the states it may move to. A state with no entry can't change.
+	Transitions map[string][]string `json:"transitions,omitempty"`
+	Why         string              `json:"why,omitempty"`
 }
 
 // Rule is a behavioural constraint beyond field validation.
@@ -94,6 +107,64 @@ type HTTPCall struct {
 type Expectancy struct {
 	Status int `json:"status"`
 	Body   any `json:"body,omitempty"`
+}
+
+// All returns the resources the service manages, in either form.
+func (s *ServiceSpec) All() []*Resource {
+	if len(s.Resources) > 0 {
+		out := make([]*Resource, len(s.Resources))
+		for i := range s.Resources {
+			out[i] = &s.Resources[i]
+		}
+		return out
+	}
+	if s.Resource != nil {
+		return []*Resource{s.Resource}
+	}
+	return nil
+}
+
+// Named returns the resource with the given singular name.
+func (s *ServiceSpec) Named(name string) *Resource {
+	for _, r := range s.All() {
+		if r.Name == name {
+			return r
+		}
+	}
+	return nil
+}
+
+// Route maps a request to the resource it addresses and the operation
+// (create, list, get, update, delete); nil and "" if none.
+func (s *ServiceSpec) Route(c HTTPCall) (*Resource, string) {
+	for _, r := range s.All() {
+		if op := endpointOf(*r, c); op != "" {
+			return r, op
+		}
+	}
+	return nil, ""
+}
+
+// KeyOf is the record key a request is about ("" for list and create
+// without a key).
+func (r Resource) KeyOf(c HTTPCall) string {
+	p := pathOnly(c.Path)
+	if k, ok := strings.CutPrefix(p, "/"+r.Plural+"/"); ok {
+		return k
+	}
+	if m, ok := c.Body.(map[string]any); ok && c.Method == "POST" {
+		if k, ok := m[r.Key].(string); ok {
+			return k
+		}
+	}
+	return ""
+}
+
+func pathOnly(p string) string {
+	if i := strings.IndexByte(p, '?'); i >= 0 {
+		return p[:i]
+	}
+	return p
 }
 
 // ParseSpec reads a spec, rejecting unknown fields.
@@ -167,7 +238,6 @@ func (s ServiceSpec) Check() []Question {
 	ask := func(sev Severity, where, format string, a ...any) {
 		qs = append(qs, Question{sev, where, fmt.Sprintf(format, a...)})
 	}
-	r := s.Resource
 	if s.Service == "" || !ident.MatchString(s.Service) {
 		ask(Blocking, "service", "what is the service called? (lowercase letters, digits and _)")
 	}
@@ -177,13 +247,116 @@ func (s ServiceSpec) Check() []Question {
 	if s.Owner == "" {
 		ask(Clarify, "owner", "who is accountable for this service's behaviour?")
 	}
-	if !ident.MatchString(r.Name) || !ident.MatchString(r.Plural) {
+	if s.Resource != nil && len(s.Resources) > 0 {
+		ask(Blocking, "resources", "the spec has both resource and resources; use resources for all of them")
+	}
+	all := s.All()
+	if len(all) == 0 {
 		ask(Blocking, "resource", "what does the service manage? (singular name and plural URL segment)")
 	}
+	multi := len(all) > 1
+	names, plurals := map[string]bool{}, map[string]bool{}
+	for i, r := range all {
+		at := "resource"
+		if len(s.Resources) > 0 {
+			at = fmt.Sprintf("resources[%d]", i)
+		}
+		if !ident.MatchString(r.Name) || !ident.MatchString(r.Plural) {
+			ask(Blocking, at, "what does the service manage? (singular name and plural URL segment)")
+			continue
+		}
+		if names[r.Name] || plurals[r.Plural] {
+			ask(Blocking, at, "%s/%s is defined twice", r.Name, r.Plural)
+		}
+		names[r.Name], plurals[r.Plural] = true, true
+		if multi {
+			at += " (" + r.Name + ")"
+		}
+		s.checkResource(*r, at, ask)
+	}
 
+	if len(s.Examples) == 0 {
+		ask(Blocking, "examples", "how will we know it works? Give examples of requests and the responses you expect")
+	}
+	type key struct{ res, op string }
+	covered := map[key]bool{}
+	statuses := map[key]map[int]bool{}
+	for i, e := range s.Examples {
+		where := fmt.Sprintf("examples[%d] (%s)", i, e.Name)
+		r, op := s.Route(e.Request)
+		if r == nil {
+			ask(Blocking, where, "%s %s is not an endpoint of this service", e.Request.Method, e.Request.Path)
+			continue
+		}
+		k := key{r.Name, op}
+		covered[k] = true
+		if statuses[k] == nil {
+			statuses[k] = map[int]bool{}
+		}
+		statuses[k][e.Expect.Status] = true
+		if e.Expect.Status < 100 || e.Expect.Status > 599 {
+			ask(Blocking, where, "what status should come back?")
+		}
+		if q := strings.IndexByte(e.Request.Path, '?'); q >= 0 && op == "list" {
+			for _, kv := range strings.Split(e.Request.Path[q+1:], "&") {
+				name, _, _ := strings.Cut(kv, "=")
+				f, ok := fieldOf(*r, name)
+				if (!ok || !f.Filterable) && e.Expect.Status != 400 { // an example may show the refusal
+					ask(Blocking, where, "%s isn't a filterable field of %s", name, r.Plural)
+				}
+			}
+		}
+	}
+	if len(s.Examples) > 0 {
+		for _, r := range all {
+			of := ""
+			if multi {
+				of = " for " + r.Plural
+			}
+			for _, op := range []string{"create", "get", "list", "update", "delete"} {
+				if !covered[key{r.Name, op}] {
+					ask(Clarify, "examples", "no example shows what %s does%s; the generated behaviour there will be unchecked", op, of)
+				}
+			}
+			for _, rule := range r.Rules {
+				if c := rule.ForbidDeleteWhen; c != nil && covered[key{r.Name, "delete"}] && !statuses[key{r.Name, "delete"}][409] {
+					ask(Clarify, "examples", "no example shows a delete being refused while %s is %v", c.Field, c.Equals)
+				}
+			}
+			if len(r.Writers) > 0 {
+				refused := false
+				for _, op := range []string{"create", "update", "delete"} {
+					refused = refused || statuses[key{r.Name, op}][403]
+				}
+				if !refused {
+					ask(Clarify, "examples", "no example shows someone outside %v being refused a change to %s", r.Writers, r.Plural)
+				}
+			}
+			for _, f := range r.Fields {
+				if len(f.Transitions) > 0 && !statuses[key{r.Name, "update"}][409] {
+					ask(Clarify, "examples", "no example shows %s.%s refusing a change it doesn't allow", r.Name, f.Name)
+				}
+			}
+		}
+	}
+
+	sort.SliceStable(qs, func(i, j int) bool { return qs[i].Severity == Blocking && qs[j].Severity != Blocking })
+	return qs
+}
+
+func fieldOf(r Resource, name string) (Field, bool) {
+	for _, f := range r.Fields {
+		if f.Name == name {
+			return f, true
+		}
+	}
+	return Field{}, false
+}
+
+func (s *ServiceSpec) checkResource(r Resource, at string, ask func(Severity, string, string, ...any)) {
 	fields := map[string]Field{}
 	for i, f := range r.Fields {
-		where := fmt.Sprintf("resource.fields[%d]", i)
+		where := fmt.Sprintf("%s.fields[%d]", at, i)
 		if !ident.MatchString(f.Name) {
 			ask(Blocking, where, "field name %q must be lowercase letters, digits and _", f.Name)
 			continue
@@ -220,15 +393,52 @@ func (s ServiceSpec) Check() []Question {
 		if f.Required && f.Default != nil {
 			ask(Clarify, where, "required fields don't need a default; which did you mean?")
 		}
+		if f.Default != nil && len(f.Enum) > 0 {
+			if d, _ := f.Default.(string); !contains(f.Enum, d) {
+				ask(Blocking, where, "default %v isn't one of %v", f.Default, f.Enum)
+			}
+		}
+		if f.References != "" {
+			target := s.Named(f.References)
+			switch {
+			case target == nil:
+				ask(Blocking, where, "references %q, which this service doesn't manage", f.References)
+			case f.Type != "string":
+				ask(Blocking, where, "a reference holds a %s's key, so it must be a string", f.References)
+			case f.Name == r.Key:
+				ask(Blocking, where, "the key can't also be a reference")
+			}
+		}
+		if len(f.Transitions) > 0 {
+			if f.Type != "string" || len(f.Enum) == 0 {
+				ask(Blocking, where, "transitions need an enum: which states can %s be in?", f.Name)
+			} else {
+				for from, tos := range f.Transitions {
+					if !contains(f.Enum, from) {
+						ask(Blocking, where, "transition from %q, which isn't one of %v", from, f.Enum)
+					}
+					for _, to := range tos {
+						if !contains(f.Enum, to) {
+							ask(Blocking, where, "transition from %q to %q, which isn't one of %v", from, to, f.Enum)
+						}
+					}
+				}
+			}
+		}
 	}
 	if kf, ok := fields[r.Key]; !ok {
-		ask(Blocking, "resource.key", "which field identifies a %s?", or(r.Name, "record"))
+		ask(Blocking, at+".key", "which field identifies a %s?", or(r.Name, "record"))
 	} else if kf.Type != "string" || !kf.Required {
-		ask(Blocking, "resource.key", "the key field %q must be a required string", r.Key)
+		ask(Blocking, at+".key", "the key field %q must be a required string", r.Key)
+	}
+	for _, w := range r.Writers {
+		if strings.TrimSpace(w) == "" {
+			ask(Blocking, at+".writers", "writers has an empty caller name")
+		}
 	}
 
 	for i, rule := range r.Rules {
-		where := fmt.Sprintf("resource.rules[%d]", i)
+		where := fmt.Sprintf("%s.rules[%d]", at, i)
 		c := rule.ForbidDeleteWhen
 		if c == nil {
 			ask(Blocking, where, "this rule constrains nothing (supported: forbid_delete_when)")
@@ -251,63 +461,18 @@ func (s ServiceSpec) Check() []Question {
 			}
 		}
 	}
-
-	if len(s.Examples) == 0 {
-		ask(Blocking, "examples", "how will we know it works? Give examples of requests and the responses you expect")
-	}
-	covered := map[string]bool{}
-	created := map[string]bool{}
-	for i, e := range s.Examples {
-		where := fmt.Sprintf("examples[%d] (%s)", i, e.Name)
-		op := endpointOf(r, e.Request)
-		if op == "" {
-			ask(Blocking, where, "%s %s is not an endpoint of this service", e.Request.Method, e.Request.Path)
-			continue
-		}
-		covered[op] = true
-		if e.Expect.Status < 100 || e.Expect.Status > 599 {
-			ask(Blocking, where, "what status should come back?")
-		}
-		if op == "create" && e.Expect.Status/100 == 2 {
-			if m, ok := e.Request.Body.(map[string]any); ok {
-				for k := range m {
-					created[k] = true
-				}
-			}
-		}
-	}
-	for _, op := range []string{"create", "get", "list", "update", "delete"} {
-		if len(s.Examples) > 0 && !covered[op] {
-			ask(Clarify, "examples", "no example shows what %s does; the generated behaviour there will be unchecked", op)
-		}
-	}
-	for _, rule := range r.Rules {
-		if c := rule.ForbidDeleteWhen; c != nil && covered["delete"] {
-			found := false
-			for _, e := range s.Examples {
-				if endpointOf(r, e.Request) == "delete" && e.Expect.Status == 409 {
-					found = true
-				}
-			}
-			if !found {
-				ask(Clarify, "examples", "no example shows a delete being refused while %s is %v", c.Field, c.Equals)
-			}
-		}
-	}
-
-	sort.SliceStable(qs, func(i, j int) bool { return qs[i].Severity == Blocking && qs[j].Severity != Blocking })
-	return qs
 }
 
 // endpointOf maps a request to an operation name, or "".
 func endpointOf(r Resource, c HTTPCall) string {
 	base := "/" + r.Plural
+	path := pathOnly(c.Path)
 	switch {
-	case c.Path == base && c.Method == "POST":
+	case path == base && c.Method == "POST":
 		return "create"
-	case c.Path == base && c.Method == "GET":
+	case path == base && c.Method == "GET":
 		return "list"
-	case strings.HasPrefix(c.Path, base+"/") && !strings.Contains(c.Path[len(base)+1:], "/"):
+	case strings.HasPrefix(path, base+"/") && !strings.Contains(path[len(base)+1:], "/"):
 		switch c.Method {
 		case "GET":
 			return "get"

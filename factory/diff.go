@@ -119,13 +119,16 @@ func DiffState(ctx context.Context, snapshot string, live, candidate *Version) (
 	}
 	defer b.Stop()
 
-	list := HTTPCall{Method: "GET", Path: "/" + live.Spec.Resource.Plural}
-	reads := []HTTPCall{list}
-	if r, err := Call(ctx, a.URL, list); err == nil {
-		if items, ok := r.Body.([]any); ok {
-			for _, it := range items {
-				if m, ok := it.(map[string]any); ok {
-					reads = append(reads, HTTPCall{Method: "GET", Path: fmt.Sprintf("/%s/%v", live.Spec.Resource.Plural, m[live.Spec.Resource.Key])})
+	var reads []HTTPCall
+	for _, res := range live.Spec.All() {
+		list := HTTPCall{Method: "GET", Path: "/" + res.Plural}
+		reads = append(reads, list)
+		if r, err := Call(ctx, a.URL, list); err == nil {
+			if items, ok := r.Body.([]any); ok {
+				for _, it := range items {
+					if m, ok := it.(map[string]any); ok {
+						reads = append(reads, HTTPCall{Method: "GET", Path: fmt.Sprintf("/%s/%v", res.Plural, m[res.Key])})
+					}
 				}
 			}
 		}
@@ -152,45 +155,58 @@ func DiffState(ctx context.Context, snapshot string, live, candidate *Version) (
 }
 
 type explainer struct {
-	// diverged records which records the two versions now hold
-	// differently, and the explained change that caused it. Later
+	// diverged records which records ("resource/key") the two versions now
+	// hold differently, and the explained change that caused it. Later
 	// differences confined to those records follow from that cause.
 	diverged  map[string]string
-	newFields map[string]bool
+	newFields map[string]map[string]bool // resource -> fields the intent added
+	changed   map[string]map[string]bool // resource -> fields whose definition changed
 	oldSpec   ServiceSpec
 	newSpec   ServiceSpec
-	newRules  []Rule
-	changed   map[string]bool // fields whose definition changed
 }
 
 func newExplainer(oldS, newS ServiceSpec) *explainer {
-	e := &explainer{newFields: map[string]bool{}, changed: map[string]bool{}, diverged: map[string]string{}, oldSpec: oldS, newSpec: newS}
-	old := map[string]Field{}
-	for _, f := range oldS.Resource.Fields {
-		old[f.Name] = f
-	}
-	for _, f := range newS.Resource.Fields {
-		o, ok := old[f.Name]
-		if !ok {
-			e.newFields[f.Name] = true
-		} else if !reflect.DeepEqual(o, f) {
-			e.changed[f.Name] = true
+	e := &explainer{newFields: map[string]map[string]bool{}, changed: map[string]map[string]bool{}, diverged: map[string]string{}, oldSpec: oldS, newSpec: newS}
+	for _, nr := range newS.All() {
+		e.newFields[nr.Name], e.changed[nr.Name] = map[string]bool{}, map[string]bool{}
+		or := oldS.Named(nr.Name)
+		old := map[string]Field{}
+		if or != nil {
+			for _, f := range or.Fields {
+				old[f.Name] = f
+			}
 		}
-	}
-	oldRules := map[string]bool{}
-	for _, r := range oldS.Resource.Rules {
-		oldRules[fmt.Sprint(r)] = true
-	}
-	for _, r := range newS.Resource.Rules {
-		if !oldRules[fmt.Sprint(r)] {
-			e.newRules = append(e.newRules, r)
+		for _, f := range nr.Fields {
+			o, ok := old[f.Name]
+			if !ok {
+				e.newFields[nr.Name][f.Name] = true
+			} else if !reflect.DeepEqual(o, f) {
+				e.changed[nr.Name][f.Name] = true
+			}
 		}
 	}
 	return e
 }
 
+// resourceFor finds the resource a request addresses, in either spec.
+func (e *explainer) resourceFor(c HTTPCall) (*Resource, *Resource, string) {
+	nr, op := e.newSpec.Route(c)
+	if nr == nil {
+		or, oop := e.oldSpec.Route(c)
+		return or, nil, oop
+	}
+	return e.oldSpec.Named(nr.Name), nr, op
+}
+
 func (e *explainer) explain(c Change) string {
-	op := endpointOf(e.newSpec.Resource, c.Request)
+	or, nr, op := e.resourceFor(c.Request)
+	if nr == nil {
+		return "" // a resource the new intent doesn't have: let a person look
+	}
+	if or == nil {
+		return "new resource " + nr.Plural
+	}
+	res := nr.Name
 
 	// Responses that differ only by fields the intent added, carrying
 	// their declared default (unless this request set them). A new field
@@ -198,7 +214,7 @@ func (e *explainer) explain(c Change) string {
 	// version, is not explained: that's a migration bug.
 	if c.Old.Status == c.New.Status {
 		vals := map[string][]any{}
-		if added := onlyAdded(c.Old.Body, c.New.Body, vals); added != nil && allIn(added, e.newFields) {
+		if added := onlyAdded(c.Old.Body, c.New.Body, vals); added != nil && allIn(added, e.newFields[res]) {
 			setByRequest := map[string]bool{}
 			if m, ok := c.Request.Body.(map[string]any); ok {
 				for k := range m {
@@ -206,7 +222,7 @@ func (e *explainer) explain(c Change) string {
 				}
 			}
 			for _, k := range added {
-				def, has := e.defaultOf(k)
+				def, has := e.defaultOf(res, k)
 				if setByRequest[k] || !has {
 					continue
 				}
@@ -219,33 +235,51 @@ func (e *explainer) explain(c Change) string {
 			return "new field " + strings.Join(added, ", ")
 		}
 	}
-	// Requests that use a field the old intent didn't have.
+	// Who may write.
+	caller := c.Request.Caller
+	if caller == "" {
+		caller = "anonymous"
+	}
+	if c.New.Status == 403 && c.Old.Status != 403 && len(nr.Writers) > 0 && !contains(nr.Writers, caller) &&
+		(len(or.Writers) == 0 || contains(or.Writers, caller)) {
+		return fmt.Sprintf("new access rule: only %s may change %s", strings.Join(nr.Writers, ", "), nr.Plural)
+	}
+	if c.Old.Status == 403 && c.New.Status != 403 && (len(nr.Writers) == 0 || contains(nr.Writers, caller)) {
+		return fmt.Sprintf("%s may now change %s", caller, nr.Plural)
+	}
+	// Requests that use a field the old intent didn't have, or whose
+	// rules changed.
 	if m, ok := c.Request.Body.(map[string]any); ok {
+		names := make([]string, 0, len(m))
 		for k := range m {
-			if e.newFields[k] {
+			names = append(names, k)
+		}
+		sort.Strings(names)
+		for _, k := range names {
+			if e.newFields[res][k] {
 				return "request uses new field " + k
 			}
-			if e.changed[k] {
-				return "rules for " + k + " changed"
+			if e.changed[res][k] {
+				return "rules for " + nr.Name + "." + k + " changed"
 			}
 		}
 	}
 	// A delete now allowed because a rule was loosened or removed.
 	if op == "delete" && c.Old.Status == 409 && c.New.Status < 400 {
-		for _, or := range e.oldSpec.Resource.Rules {
-			oc := or.ForbidDeleteWhen
+		for _, orule := range or.Rules {
+			oc := orule.ForbidDeleteWhen
 			if oc == nil {
 				continue
 			}
 			name := fmt.Sprintf("no delete while %s is %v", oc.Field, oc.Equals)
 			found := false
-			for _, nr := range e.newSpec.Resource.Rules {
-				nc := nr.ForbidDeleteWhen
+			for _, nrule := range nr.Rules {
+				nc := nrule.ForbidDeleteWhen
 				if nc == nil || nc.Field != oc.Field || fmt.Sprint(nc.Equals) != fmt.Sprint(oc.Equals) {
 					continue
 				}
 				found = true
-				if c.Request.Caller != "" && contains(nr.ExceptCallers, c.Request.Caller) && !contains(or.ExceptCallers, c.Request.Caller) {
+				if c.Request.Caller != "" && contains(nrule.ExceptCallers, c.Request.Caller) && !contains(orule.ExceptCallers, c.Request.Caller) {
 					return fmt.Sprintf("%s exempted from rule: %s", c.Request.Caller, name)
 				}
 			}
@@ -254,32 +288,29 @@ func (e *explainer) explain(c Change) string {
 			}
 		}
 	}
-	// A delete now refused by a new rule.
+	// A delete now refused by a new rule, or by a new relation.
 	if op == "delete" && c.New.Status == 409 {
-		for _, r := range e.newRules {
-			if r.ForbidDeleteWhen != nil {
+		oldRules := map[string]bool{}
+		for _, r := range or.Rules {
+			oldRules[fmt.Sprint(r.ForbidDeleteWhen)] = true
+		}
+		for _, r := range nr.Rules {
+			if r.ForbidDeleteWhen != nil && !oldRules[fmt.Sprint(r.ForbidDeleteWhen)] {
 				return fmt.Sprintf("new rule: no delete while %s is %v", r.ForbidDeleteWhen.Field, r.ForbidDeleteWhen.Equals)
+			}
+		}
+		for _, other := range e.newSpec.All() {
+			for _, f := range other.Fields {
+				if f.References == res && (e.newFields[other.Name][f.Name] || e.changed[other.Name][f.Name] || e.oldSpec.Named(other.Name) == nil) {
+					return fmt.Sprintf("new relation: %s.%s references %s", other.Name, f.Name, res)
+				}
 			}
 		}
 	}
 	// Differences confined to records an earlier, explained change made
 	// diverge follow from that change.
-	if why := e.downstream(c); why != "" {
+	if why := e.downstream(c, *nr); why != "" {
 		return why
-	}
-	return ""
-}
-
-// recordKey is the record a request is about, if any.
-func (e *explainer) recordKey(c HTTPCall) string {
-	base := "/" + e.newSpec.Resource.Plural + "/"
-	if strings.HasPrefix(c.Path, base) {
-		return strings.TrimPrefix(c.Path, base)
-	}
-	if m, ok := c.Body.(map[string]any); ok && c.Method == "POST" {
-		if k, ok := m[e.newSpec.Resource.Key].(string); ok {
-			return k
-		}
 	}
 	return ""
 }
@@ -290,19 +321,24 @@ func (e *explainer) track(c Change) {
 	if c.Because == "" || c.Request.Method == "GET" || c.Old.Status == c.New.Status {
 		return
 	}
-	if k := e.recordKey(c.Request); k != "" {
-		if _, seen := e.diverged[k]; !seen {
-			e.diverged[k] = c.Because
+	_, nr, _ := e.resourceFor(c.Request)
+	if nr == nil {
+		return
+	}
+	if k := nr.KeyOf(c.Request); k != "" {
+		id := nr.Name + "/" + k
+		if _, seen := e.diverged[id]; !seen {
+			e.diverged[id] = c.Because
 		}
 	}
 }
 
-func (e *explainer) downstream(c Change) string {
+func (e *explainer) downstream(c Change, r Resource) string {
 	if len(e.diverged) == 0 {
 		return ""
 	}
-	if k := e.recordKey(c.Request); k != "" {
-		if why, ok := e.diverged[k]; ok {
+	if k := r.KeyOf(c.Request); k != "" {
+		if why, ok := e.diverged[r.Name+"/"+k]; ok {
 			e.track(Change{Request: c.Request, Old: c.Old, New: c.New, Because: why})
 			return "follows from earlier change (" + why + ")"
 		}
@@ -315,12 +351,11 @@ func (e *explainer) downstream(c Change) string {
 	if c.Request.Method != "GET" || !ok1 || !ok2 {
 		return ""
 	}
-	key := e.newSpec.Resource.Key
 	index := func(l []any) map[string]any {
 		out := map[string]any{}
 		for _, it := range l {
 			if m, ok := it.(map[string]any); ok {
-				out[fmt.Sprint(m[key])] = it
+				out[fmt.Sprint(m[r.Key])] = it
 			}
 		}
 		return out
@@ -335,11 +370,11 @@ func (e *explainer) downstream(c Change) string {
 				continue
 			}
 			vals := map[string][]any{}
-			if added := onlyAdded(o, n, vals); added != nil && allIn(added, e.newFields) && e.atDefaults(vals) {
+			if added := onlyAdded(o, n, vals); added != nil && allIn(added, e.newFields[r.Name]) && e.atDefaults(r.Name, vals) {
 				continue
 			}
 		}
-		why, ok := e.diverged[k]
+		why, ok := e.diverged[r.Name+"/"+k]
 		if !ok {
 			return ""
 		}
@@ -356,9 +391,9 @@ func (e *explainer) downstream(c Change) string {
 	return "follows from earlier change (" + strings.Join(rs, "; ") + ")"
 }
 
-func (e *explainer) atDefaults(vals map[string][]any) bool {
+func (e *explainer) atDefaults(res string, vals map[string][]any) bool {
 	for k, vs := range vals {
-		def, ok := e.defaultOf(k)
+		def, ok := e.defaultOf(res, k)
 		if !ok {
 			continue
 		}
@@ -382,10 +417,12 @@ func union(a, b map[string]any) map[string]bool {
 	return out
 }
 
-func (e *explainer) defaultOf(field string) (any, bool) {
-	for _, f := range e.newSpec.Resource.Fields {
-		if f.Name == field && f.Default != nil {
-			return f.Default, true
+func (e *explainer) defaultOf(res, field string) (any, bool) {
+	if r := e.newSpec.Named(res); r != nil {
+		for _, f := range r.Fields {
+			if f.Name == field && f.Default != nil {
+				return f.Default, true
+			}
 		}
 	}
 	return nil, false

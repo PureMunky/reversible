@@ -1,0 +1,58 @@
+
+━━━ 1 · Phil writes an intent spec. The first draft has problems
+   ? [blocking] rules[0] (card.charg): no effect type "card.charg" is registered; did you mean "card.charge"?
+   ? [blocking] rules[3] (card.charge): card.charge.amount must be at least 100 and at most 80; no value satisfies both
+   ? [blocking] guardrails[0] (revenu): no simulator predicts "revenu", so this guardrail could never fire; did you mean "revenue"?
+   ? [clarify] owner: who is accountable for this intent?
+
+━━━    Phil answers the questions; the revised spec compiles cleanly
+   3 invariants, 2 guardrails, owner phil
+
+━━━ 2 · The $55 champion serves 80 customers; their requests are recorded
+
+━━━ 3 · The pricing agent proposes five variants. Each must pass the replay gate
+   ✗ $55+purge       rejected   candidate violates invariants on 80 request(s)
+   ✗ $55-no-receipt  rejected   candidate violates invariants on 80 request(s)
+   ✗ $99             rejected   predicted churn rises +58.3% (guardrail: at most +25%)
+   ✓ $65             admitted   (predicted revenue +17.3%, churn +13.2%)
+   ✓ $52             admitted   (predicted revenue -5.3%, churn -4.0%)
+
+━━━ 4 · 600 more customers arrive; real outcomes are attributed to each variant
+   $55    champion   n=387  revenue/customer=$51.16  churn= 7.0%
+   $65    challenger n=150  revenue/customer=$37.27  churn=42.7%
+   $52    challenger n=143  revenue/customer=$49.09  churn= 5.6%
+   customers currently on $65: 150
+
+━━━ 5 · Evaluate: outcomes decide, but only with evidence
+   retired $65 (guardrail breach): observed revenue falls -27.2% (guardrail: at most -10%), p=4.6e-07; observed churn rises +511.6% (guardrail: at most +25%), p=6.9e-15
+     rewound decision try-65: 150 intent(s) undone
+   waiting on $52: revenue -4.0%, p=0.95 (need <0.03 and lift ≥2%)
+   customers on $65 after auto-rewind: 0   (their charges and receipts were never released)
+   the simulator predicted $65 was safe; reality disagreed, and reality won
+   $52's first customers aren't conclusive either way, so it keeps running instead of being judged on luck
+
+━━━ 6 · More customers arrive until the data is conclusive
+   + 1000 customers: revenue +0.2%, p=0.44 (need <0.0076 and lift ≥2%)
+   + 2000 customers: revenue +1.2%, p=0.15 (need <0.0034 and lift ≥2%)
+   + 3000 customers: revenue +1.2%, p=0.11 (need <0.0019 and lift ≥2%)
+   + 4000 customers: revenue +0.8%, p=0.18 (need <0.0012 and lift ≥2%)
+   + 5000 customers: revenue +0.8%, p=0.15 (need <0.00084 and lift ≥2%)
+   + 6000 customers: revenue +1.0%, p=0.086 (need <0.00062 and lift ≥2%)
+   + 7000 customers: revenue +1.0%, p=0.069 (need <0.00047 and lift ≥2%)
+   + 8000 customers: revenue +1.2%, p=0.027 (need <0.00038 and lift ≥2%)
+   + 9000 customers: revenue +1.7%, p=0.0043 (need <0.0003 and lift ≥2%)
+   +10000 customers: revenue +1.9%, p=0.0011 (need <0.00025 and lift ≥2%)
+   +11000 customers: revenue +1.8%, p=0.00074 (need <0.00021 and lift ≥2%)
+   promoted $52 over $55 (+2.0% on objective, p=0.0001)
+   champion is now $52
+
+━━━ 7 · Meanwhile the simulator has been learning from every outcome
+   churn    n=12680  observed ≈ -0.299 + 7.28 × predicted, error (RMSE) 0.287 → 0.284
+   revenue  n=12680  observed ≈ 83.2 + -0.677 × predicted, error (RMSE) 15.7 → 15.3
+   ✗ $65 again    rejected by the calibrated gate: predicted revenue falls -15.6% (guardrail: at most -10%)
+
+━━━ 8 · Anyone with the public keys can verify who decided what
+   12704 records, hash-chained and signed: phil=1 pricing-agent=12687 evolve=16
+   chain verifies ✓
+   after rewriting try-65's rationale: decision log fails verification at record 86: content does not match its hash (record was altered)
+   (the stored log itself is untouched ✓)

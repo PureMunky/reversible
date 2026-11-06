@@ -121,12 +121,12 @@ type crashy struct{}
 func (crashy) Code(ctx context.Context, s ServiceSpec, prev map[string]string, f []Result) (map[string]string, error) {
 	files, err := Codegen{}.Code(ctx, s, prev, f)
 	if err == nil {
-		files["main.go"] = strings.Replace(files["main.go"], `		rec, ok := store[r.PathValue("key")]`,
+		files["main.go"] = strings.Replace(files["main.go"], `		rec, ok := storeFlag[r.PathValue("key")]`,
 			`		if r.PathValue("key") == "boom" {
 			fail(w, 500, "internal error")
 			return
 		}
-		rec, ok := store[r.PathValue("key")]`, 1)
+		rec, ok := storeFlag[r.PathValue("key")]`, 1)
 	}
 	return files, err
 }

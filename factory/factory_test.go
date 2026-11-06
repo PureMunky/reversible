@@ -193,7 +193,7 @@ func (forgetful) Code(ctx context.Context, s ServiceSpec, prev map[string]string
 	if err != nil {
 		return nil, err
 	}
-	files["main.go"] = strings.Replace(files["main.go"], "r := defaults() // records written by an older version get today's defaults", "var r Flag", 1)
+	files["main.go"] = strings.Replace(files["main.go"], "r := defaultsFlag() // records written by an older version get today's defaults", "var r Flag", 1)
 	return files, nil
 }
 

@@ -6,7 +6,7 @@ In an agentic world, writing code is cheap. What's scarce is knowing exactly wha
 
 `reversible` is a working prototype of that idea's foundations, in Go with no dependencies. Every action an agent takes is *declared up front* and *undoable by construction*; every decision is *traceable and rewindable*; every proposed change is *replayed against real traffic* and evolved against the current version on evidence. Only the actions that truly can't be undone reach a person.
 
-**Where it stands:** the first end-to-end slice of the root idea works. A conversation becomes intent, a real service is generated from it, built, verified, diffed by behaviour against production traffic and data, signed off, released and rewound, with no person writing or editing code (`cmd/factory`). Underneath are the foundations: reversible effects, a signed decision ledger, replay, simulation, evolution and synthesis. Other demos use pricing as an example domain; nothing in the mechanism assumes it. What's still open is listed in [PRINCIPLES.md](PRINCIPLES.md#where-the-repo-stands-against-the-root-idea).
+**Where it stands:** the first end-to-end slice of the root idea works. A conversation becomes intent, a real service is generated from it, built, verified, diffed by behaviour against production traffic and data, signed off, released and rewound, with no person writing or editing code (`cmd/factory`, and the same factory builds an incident tracker in `cmd/incidents`). Underneath are the foundations: reversible effects, a signed decision ledger, replay, simulation, evolution and synthesis. Other demos use pricing as an example domain; nothing in the mechanism assumes it. What's still open is listed in [PRINCIPLES.md](PRINCIPLES.md#where-the-repo-stands-against-the-root-idea).
 
 ## The root idea, end to end
 
@@ -37,6 +37,17 @@ A real service built, changed, released and rewound from conversation. Nobody wr
 With `-brittle-coder`, the v2 build fails reads of any flag with a description. No example reads one and the review sees none, so it passes everything before release; in the canary it fails real requests, the error guardrail trips after 200 requests (5 of 221 requests ever failed, all on the canary's share), the decision behind it is rewound and v1 serves everything.
 
 With `-faulty-coder`, the v2 build still passes all 12 examples, but reading production data through it shows every existing flag that was on silently dropping to 0% rollout. That change isn't explained by anything Phil asked for, so it isn't released. Examples alone would have shipped it.
+
+### The same factory, another kind of software
+
+Feature flags are an example, and so is the next one. `go run ./cmd/incidents` uses the same factory, with nothing in it specific to either domain, to build an incident tracker for an on-call rotation: two resources (services and incidents) that reference each other, a lifecycle (open → acknowledged → resolved), filters (`GET /incidents?status=open`) and who may change what. All of it is intent; none of it is code a person writes.
+
+1. **Priya, the on-call lead, describes it.** Incidents are always about a known service; only the platform team registers services; a service can't be removed while incidents point at it; open incidents are never deleted; a resolved incident stays resolved. The spec is 18 examples and the checker has no questions. 576 generated lines pass all 18.
+2. **A week of on-call** runs through it, including the refusals the intent asks for: an incident about an unknown service, reopening a resolved one, deleting an open one, a team registering its own service.
+3. **Priya changes the intent:** a *mitigated* step before resolving, a commander per incident, and only on-call changes incidents. The review traces every behaviour change on the week's traffic to her words: the new field, the new access rule (the status page's summary edits would now be refused), and the new lifecycle. Both versions running on the same data keep each other's fields. The canary promotes it.
+4. **Production raises two questions.** The status page bot had summary edits refused; on-call had resolves refused because the incidents weren't mitigated yet. Priya lets the bot write and keeps the lifecycle: the first was a gap in the intent, the second is the intent working. v3 is generated with those requests (and the records they act on) captured as examples; a week later, no new findings.
+
+What this shows, and what it doesn't: the spec language now covers records, relations, lifecycles, filters and access. Software that computes, runs jobs, reacts to events or calls other systems still has to be written by hand; that's the next gap between this and building any software from intent.
 
 ## Layers
 

@@ -527,7 +527,7 @@ type forgetful struct{ factory.Coder }
 func (f forgetful) Code(ctx context.Context, s factory.ServiceSpec, prev map[string]string, fail []factory.Result) (map[string]string, error) {
 	files, err := f.Coder.Code(ctx, s, prev, fail)
 	if err == nil {
-		files["main.go"] = strings.Replace(files["main.go"], "r := defaults() // records written by an older version get today's defaults", "var r Flag", 1)
+		files["main.go"] = strings.Replace(files["main.go"], "r := defaultsFlag() // records written by an older version get today's defaults", "var r Flag", 1)
 	}
 	return files, err
 }

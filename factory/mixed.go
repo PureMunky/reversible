@@ -39,43 +39,81 @@ func MixedCheck(ctx context.Context, live, candidate *Version) ([]string, error)
 
 	var problems []string
 	check := func(writer, rewriter, reader *Instance, writerSpec, rewriterSpec ServiceSpec, key, writerName, rewriterName string) error {
-		only := fieldsOnlyIn(writerSpec, rewriterSpec)
-		if len(only) == 0 {
-			return nil
-		}
-		body, ok := sampleRecord(writerSpec, key, only)
-		if !ok {
-			problems = append(problems, fmt.Sprintf("couldn't build a sample %s to check (key pattern); fields %v unchecked", writerSpec.Resource.Name, names(only)))
-			return nil
-		}
-		r := writerSpec.Resource
-		created, err := Call(ctx, writer.URL, HTTPCall{Method: "POST", Path: "/" + r.Plural, Body: body})
-		if err != nil {
-			return err
-		}
-		if created.Status/100 != 2 {
-			problems = append(problems, fmt.Sprintf("the %s couldn't create a sample %s: %d %s", writerName, r.Name, created.Status, short(created.Body)))
-			return nil
-		}
-		if patch, ok := touch(writerSpec, rewriterSpec); ok {
-			resp, err := Call(ctx, rewriter.URL, HTTPCall{Method: "PATCH", Path: "/" + r.Plural + "/" + key, Body: patch})
+		for _, wr := range writerSpec.All() {
+			rr := rewriterSpec.Named(wr.Name)
+			if rr == nil {
+				continue // a resource only one version has is preserved whole by the other (checked by the contract)
+			}
+			only := fieldsOnlyIn(*wr, *rr)
+			if len(only) == 0 {
+				continue
+			}
+			as := func(r *Resource) string {
+				if len(r.Writers) > 0 {
+					return r.Writers[0]
+				}
+				return ""
+			}
+			// Records this one must reference exist first.
+			parents := map[string]string{}
+			for _, f := range wr.Fields {
+				if f.References == "" || !f.Required {
+					continue
+				}
+				ref := writerSpec.Named(f.References)
+				if ref == nil {
+					continue
+				}
+				pkey := sampleKey(writerSpec, *ref, key+"-"+ref.Name)
+				pbody, ok := sampleRecord(*ref, pkey, nil, nil)
+				if !ok {
+					problems = append(problems, fmt.Sprintf("couldn't build a sample %s to check %s; fields %v unchecked", ref.Name, wr.Name, names(only)))
+					return nil
+				}
+				resp, err := Call(ctx, writer.URL, HTTPCall{Method: "POST", Path: "/" + ref.Plural, Body: pbody, Caller: as(ref)})
+				if err != nil {
+					return err
+				}
+				if resp.Status/100 != 2 && resp.Status != 409 {
+					problems = append(problems, fmt.Sprintf("the %s couldn't create a sample %s: %d %s", writerName, ref.Name, resp.Status, short(resp.Body)))
+					return nil
+				}
+				parents[f.Name] = pkey
+			}
+			key := sampleKey(writerSpec, *wr, key)
+			body, ok := sampleRecord(*wr, key, only, parents)
+			if !ok {
+				problems = append(problems, fmt.Sprintf("couldn't build a sample %s to check (key pattern); fields %v unchecked", wr.Name, names(only)))
+				continue
+			}
+			created, err := Call(ctx, writer.URL, HTTPCall{Method: "POST", Path: "/" + wr.Plural, Body: body, Caller: as(wr)})
 			if err != nil {
 				return err
 			}
-			if resp.Status/100 != 2 {
-				problems = append(problems, fmt.Sprintf("the %s couldn't update a %s the %s created: %d %s", rewriterName, r.Name, writerName, resp.Status, short(resp.Body)))
-				return nil
+			if created.Status/100 != 2 {
+				problems = append(problems, fmt.Sprintf("the %s couldn't create a sample %s: %d %s", writerName, wr.Name, created.Status, short(created.Body)))
+				continue
 			}
-		}
-		got, err := Call(ctx, reader.URL, HTTPCall{Method: "GET", Path: "/" + r.Plural + "/" + key})
-		if err != nil {
-			return err
-		}
-		m, _ := got.Body.(map[string]any)
-		for _, f := range only {
-			if !reflect.DeepEqual(m[f.Name], body[f.Name]) {
-				problems = append(problems, fmt.Sprintf("%s set by the %s was lost when the %s rewrote the record (wrote %v, read back %v)",
-					f.Name, writerName, rewriterName, body[f.Name], m[f.Name]))
+			if patch, ok := touch(*wr, *rr); ok {
+				resp, err := Call(ctx, rewriter.URL, HTTPCall{Method: "PATCH", Path: "/" + rr.Plural + "/" + key, Body: patch, Caller: as(rr)})
+				if err != nil {
+					return err
+				}
+				if resp.Status/100 != 2 {
+					problems = append(problems, fmt.Sprintf("the %s couldn't update a %s the %s created: %d %s", rewriterName, wr.Name, writerName, resp.Status, short(resp.Body)))
+					continue
+				}
+			}
+			got, err := Call(ctx, reader.URL, HTTPCall{Method: "GET", Path: "/" + wr.Plural + "/" + key})
+			if err != nil {
+				return err
+			}
+			m, _ := got.Body.(map[string]any)
+			for _, f := range only {
+				if !reflect.DeepEqual(m[f.Name], body[f.Name]) {
+					problems = append(problems, fmt.Sprintf("%s set by the %s was lost when the %s rewrote the record (wrote %v, read back %v)",
+						qualified(writerSpec, wr, f.Name), writerName, rewriterName, body[f.Name], m[f.Name]))
+				}
 			}
 		}
 		return nil
@@ -89,14 +127,54 @@ func MixedCheck(ctx context.Context, live, candidate *Version) ([]string, error)
 	return problems, nil
 }
 
-func fieldsOnlyIn(a, b ServiceSpec) []Field {
+// sampleKey finds a key the resource accepts: the given one, or else one
+// derived from the keys its examples create (inc-1 → inc-19097), since a
+// key pattern can't in general be inverted.
+func sampleKey(s ServiceSpec, r Resource, base string) string {
+	var pattern *regexp.Regexp
+	for _, f := range r.Fields {
+		if f.Name == r.Key && f.Pattern != "" {
+			pattern = regexp.MustCompile(f.Pattern)
+		}
+	}
+	if pattern == nil || pattern.MatchString(base) {
+		return base
+	}
+	n := 0
+	for _, c := range base {
+		n = (n*31 + int(c)) % 1000
+	}
+	for _, e := range s.Examples {
+		if er, op := s.Route(e.Request); er == nil || er.Name != r.Name || op != "create" {
+			continue
+		}
+		b, _ := e.Request.Body.(map[string]any)
+		k, _ := b[r.Key].(string)
+		for _, c := range []string{fmt.Sprintf("%s9%03d", k, n), k + "-" + base, fmt.Sprintf("%s%03d", base, n)} {
+			if k != "" && pattern.MatchString(c) {
+				return c
+			}
+		}
+	}
+	return base
+}
+
+// qualified names a field, with its resource when there are several.
+func qualified(s ServiceSpec, r *Resource, field string) string {
+	if len(s.All()) > 1 {
+		return r.Name + "." + field
+	}
+	return field
+}
+
+func fieldsOnlyIn(a, b Resource) []Field {
 	inB := map[string]bool{}
-	for _, f := range b.Resource.Fields {
+	for _, f := range b.Fields {
 		inB[f.Name] = true
 	}
 	var out []Field
-	for _, f := range a.Resource.Fields {
-		if !inB[f.Name] && f.Name != a.Resource.Key {
+	for _, f := range a.Fields {
+		if !inB[f.Name] && f.Name != a.Key && f.References == "" {
 			out = append(out, f)
 		}
 	}
@@ -147,12 +225,19 @@ func sampleValue(f Field) (any, bool) {
 	return nil, false
 }
 
-func sampleRecord(s ServiceSpec, key string, extra []Field) (map[string]any, bool) {
-	r := s.Resource
+func sampleRecord(r Resource, key string, extra []Field, refs map[string]string) (map[string]any, bool) {
 	body := map[string]any{r.Key: key}
 	for _, f := range r.Fields {
 		if f.Name == r.Key {
 			if f.Pattern != "" && !regexp.MustCompile(f.Pattern).MatchString(key) {
+				return nil, false
+			}
+			continue
+		}
+		if f.References != "" {
+			if v, ok := refs[f.Name]; ok {
+				body[f.Name] = v
+			} else if f.Required {
 				return nil, false
 			}
 			continue
@@ -174,14 +259,15 @@ func sampleRecord(s ServiceSpec, key string, extra []Field) (map[string]any, boo
 }
 
 // touch builds an update to a field both versions know, so the rewriting
-// version has to rewrite the whole record.
-func touch(writer, rewriter ServiceSpec) (map[string]any, bool) {
+// version has to rewrite the whole record. Fields with references or
+// transitions are left alone: changing them is governed by other rules.
+func touch(writer, rewriter Resource) (map[string]any, bool) {
 	inW := map[string]Field{}
-	for _, f := range writer.Resource.Fields {
+	for _, f := range writer.Fields {
 		inW[f.Name] = f
 	}
-	for _, f := range rewriter.Resource.Fields {
-		if f.Name == rewriter.Resource.Key {
+	for _, f := range rewriter.Fields {
+		if f.Name == rewriter.Key || f.References != "" || len(f.Transitions) > 0 {
 			continue
 		}
 		if _, ok := inW[f.Name]; !ok {

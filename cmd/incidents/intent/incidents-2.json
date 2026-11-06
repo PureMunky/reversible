@@ -1,0 +1,444 @@
+{
+  "service": "incidents",
+  "purpose": "An incident tracker for the on-call rotation: which services exist and who owns them, what is broken right now, and where each incident is in its lifecycle, so responders and the status page work from one record.",
+  "owner": "priya",
+  "resources": [
+    {
+      "name": "service",
+      "plural": "services",
+      "key": "name",
+      "writers": [
+        "platform-team"
+      ],
+      "fields": [
+        {
+          "name": "name",
+          "type": "string",
+          "required": true,
+          "pattern": "^[a-z][a-z0-9-]*$",
+          "why": "service names appear in alerts and URLs"
+        },
+        {
+          "name": "team",
+          "type": "string",
+          "required": true,
+          "why": "every service has an owning team to page"
+        },
+        {
+          "name": "tier",
+          "type": "string",
+          "enum": [
+            "critical",
+            "standard"
+          ],
+          "default": "standard",
+          "filterable": true
+        }
+      ]
+    },
+    {
+      "name": "incident",
+      "plural": "incidents",
+      "key": "id",
+      "fields": [
+        {
+          "name": "id",
+          "type": "string",
+          "required": true,
+          "pattern": "^inc-[0-9]+$"
+        },
+        {
+          "name": "service",
+          "type": "string",
+          "required": true,
+          "references": "service",
+          "filterable": true,
+          "why": "an incident is always about a service we know"
+        },
+        {
+          "name": "severity",
+          "type": "string",
+          "required": true,
+          "enum": [
+            "sev1",
+            "sev2",
+            "sev3"
+          ],
+          "filterable": true
+        },
+        {
+          "name": "status",
+          "type": "string",
+          "enum": [
+            "open",
+            "acknowledged",
+            "mitigated",
+            "resolved"
+          ],
+          "default": "open",
+          "filterable": true,
+          "transitions": {
+            "open": [
+              "acknowledged",
+              "resolved"
+            ],
+            "acknowledged": [
+              "mitigated"
+            ],
+            "mitigated": [
+              "resolved",
+              "acknowledged"
+            ]
+          },
+          "why": "incidents move forward, and are only resolved once mitigated (open straight to resolved is a false alarm); a resolved incident that recurs is a new incident"
+        },
+        {
+          "name": "summary",
+          "type": "string",
+          "required": true
+        },
+        {
+          "name": "commander",
+          "type": "string",
+          "why": "who is running the response"
+        }
+      ],
+      "rules": [
+        {
+          "forbid_delete_when": {
+            "field": "status",
+            "equals": "open"
+          },
+          "why": "an open incident is someone's emergency; resolve it, don't delete it"
+        }
+      ],
+      "writers": [
+        "on-call"
+      ]
+    }
+  ],
+  "examples": [
+    {
+      "name": "register a service",
+      "request": {
+        "method": "POST",
+        "path": "/services",
+        "body": {
+          "name": "checkout",
+          "team": "payments"
+        },
+        "caller": "platform-team"
+      },
+      "expect": {
+        "status": 201,
+        "body": {
+          "name": "checkout",
+          "team": "payments",
+          "tier": "standard"
+        }
+      }
+    },
+    {
+      "name": "only the platform team registers services",
+      "request": {
+        "method": "POST",
+        "path": "/services",
+        "body": {
+          "name": "search",
+          "team": "search"
+        },
+        "caller": "on-call"
+      },
+      "expect": {
+        "status": 403
+      }
+    },
+    {
+      "name": "list services",
+      "request": {
+        "method": "GET",
+        "path": "/services"
+      },
+      "expect": {
+        "status": 200,
+        "body": [
+          {
+            "name": "checkout"
+          }
+        ]
+      }
+    },
+    {
+      "name": "mark it critical",
+      "request": {
+        "method": "PATCH",
+        "path": "/services/checkout",
+        "body": {
+          "tier": "critical"
+        },
+        "caller": "platform-team"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "tier": "critical"
+        }
+      }
+    },
+    {
+      "name": "read a service",
+      "request": {
+        "method": "GET",
+        "path": "/services/checkout"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "team": "payments",
+          "tier": "critical"
+        }
+      }
+    },
+    {
+      "name": "open an incident",
+      "request": {
+        "method": "POST",
+        "path": "/incidents",
+        "body": {
+          "id": "inc-1",
+          "service": "checkout",
+          "severity": "sev2",
+          "summary": "checkout latency over 2s"
+        },
+        "caller": "on-call"
+      },
+      "expect": {
+        "status": 201,
+        "body": {
+          "id": "inc-1",
+          "status": "open"
+        }
+      }
+    },
+    {
+      "name": "incidents are about known services",
+      "request": {
+        "method": "POST",
+        "path": "/incidents",
+        "body": {
+          "id": "inc-2",
+          "service": "nope",
+          "severity": "sev3",
+          "summary": "?"
+        },
+        "caller": "on-call"
+      },
+      "expect": {
+        "status": 400
+      }
+    },
+    {
+      "name": "an open incident can't be deleted",
+      "request": {
+        "method": "DELETE",
+        "path": "/incidents/inc-1",
+        "caller": "on-call"
+      },
+      "expect": {
+        "status": 409
+      }
+    },
+    {
+      "name": "a service with incidents can't be deleted",
+      "request": {
+        "method": "DELETE",
+        "path": "/services/checkout",
+        "caller": "platform-team"
+      },
+      "expect": {
+        "status": 409
+      }
+    },
+    {
+      "name": "acknowledge it",
+      "request": {
+        "method": "PATCH",
+        "path": "/incidents/inc-1",
+        "body": {
+          "status": "acknowledged"
+        },
+        "caller": "on-call"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "status": "acknowledged"
+        }
+      }
+    },
+    {
+      "name": "what's being worked on",
+      "request": {
+        "method": "GET",
+        "path": "/incidents?status=acknowledged"
+      },
+      "expect": {
+        "status": 200,
+        "body": [
+          {
+            "id": "inc-1"
+          }
+        ]
+      }
+    },
+    {
+      "name": "only some fields filter",
+      "request": {
+        "method": "GET",
+        "path": "/incidents?summary=latency"
+      },
+      "expect": {
+        "status": 400
+      }
+    },
+    {
+      "name": "read an incident",
+      "request": {
+        "method": "GET",
+        "path": "/incidents/inc-1"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "service": "checkout",
+          "severity": "sev2"
+        }
+      }
+    },
+    {
+      "name": "the status page only reads",
+      "request": {
+        "method": "PATCH",
+        "path": "/incidents/inc-1",
+        "body": {
+          "summary": "we're looking into it"
+        },
+        "caller": "status-page-bot"
+      },
+      "expect": {
+        "status": 403
+      }
+    },
+    {
+      "name": "name a commander",
+      "request": {
+        "method": "PATCH",
+        "path": "/incidents/inc-1",
+        "body": {
+          "commander": "sam"
+        },
+        "caller": "on-call"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "commander": "sam"
+        }
+      }
+    },
+    {
+      "name": "resolving needs mitigation first",
+      "request": {
+        "method": "PATCH",
+        "path": "/incidents/inc-1",
+        "body": {
+          "status": "resolved"
+        },
+        "caller": "on-call"
+      },
+      "expect": {
+        "status": 409
+      }
+    },
+    {
+      "name": "mitigate it",
+      "request": {
+        "method": "PATCH",
+        "path": "/incidents/inc-1",
+        "body": {
+          "status": "mitigated"
+        },
+        "caller": "on-call"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "status": "mitigated"
+        }
+      }
+    },
+    {
+      "name": "resolve it",
+      "request": {
+        "method": "PATCH",
+        "path": "/incidents/inc-1",
+        "body": {
+          "status": "resolved"
+        },
+        "caller": "on-call"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "status": "resolved"
+        }
+      }
+    },
+    {
+      "name": "resolved incidents stay resolved",
+      "request": {
+        "method": "PATCH",
+        "path": "/incidents/inc-1",
+        "body": {
+          "status": "open"
+        },
+        "caller": "on-call"
+      },
+      "expect": {
+        "status": 409
+      }
+    },
+    {
+      "name": "resolved incidents can be cleaned up",
+      "request": {
+        "method": "DELETE",
+        "path": "/incidents/inc-1",
+        "caller": "on-call"
+      },
+      "expect": {
+        "status": 204
+      }
+    },
+    {
+      "name": "then the service can go",
+      "request": {
+        "method": "DELETE",
+        "path": "/services/checkout",
+        "caller": "platform-team"
+      },
+      "expect": {
+        "status": 204
+      }
+    },
+    {
+      "name": "and it's gone",
+      "request": {
+        "method": "GET",
+        "path": "/services/checkout"
+      },
+      "expect": {
+        "status": 404
+      }
+    }
+  ]
+}
