@@ -48,6 +48,9 @@ data:
         metrics_path: /metrics
         static_configs:
           - targets: [demo.reversible.svc.cluster.local:8080]
+      - job_name: model-gateway # the gateway's budget and requests
+        static_configs:
+          - targets: [model-gateway.reversible.svc.cluster.local:8080]
       - job_name: prometheus
         static_configs:
           - targets: [localhost:9090]

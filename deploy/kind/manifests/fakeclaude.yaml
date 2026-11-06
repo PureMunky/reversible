@@ -1,6 +1,8 @@
 # The rehearsal stand-in for the Messages API (cmd/fakeclaude): answers
 # coding requests with the deterministic generator's code. No model, no
-# key, no cost; only rehearsal pods can reach it.
+# key, no cost. In a rehearsal the model gateway forwards to it instead of
+# api.anthropic.com, so the whole live path runs; only the gateway can
+# reach it.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -47,20 +49,3 @@ spec:
   selector: {app.kubernetes.io/name: fakeclaude}
   ports:
     - {name: http, port: 8080, targetPort: 8080}
----
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: rehearsal
-  namespace: reversible
-data:
-  ANTHROPIC_API_KEY: rehearsal-not-a-real-key
-  ANTHROPIC_BASE_URL: http://fakeclaude.reversible.svc.cluster.local:8080
----
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: offline
-  namespace: reversible
-data:
-  REVERSIBLE_MODE: offline

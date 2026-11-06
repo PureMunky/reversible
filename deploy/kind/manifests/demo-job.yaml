@@ -1,10 +1,19 @@
 # One demo run. run.sh fills in the __PLACEHOLDERS__ for the mode
 # (offline, rehearsal, live) and the demo (incidents, factory).
 #
-# The pod runs the demo's whole story (build, release, canary, findings),
-# then keeps production serving on 8080 with an inspector at /_factory/
-# until the Job is deleted or two hours pass. Telemetry (/metrics,
-# /_factory/events, /_factory/live) is served on 8080 from the start.
+# Two containers, so model-written code never runs beside the factory:
+#   factory  builds each version, reviews it, releases it; holds the run's
+#            gateway token (not the API key, which only the gateway has)
+#   sandbox  the only place generated services run (cmd/runner, a native
+#            sidecar): its own process namespace, so it can't see the
+#            factory's processes, environment or memory; no token, no
+#            secrets; it shares only the work volume and the pod network
+# The pod's network reaches the model gateway and nothing else (base.yaml).
+#
+# The pod runs the demo's whole story, then keeps production serving on
+# 8080 with an inspector at /_factory/ until the Job is deleted or two
+# hours pass. Telemetry (/metrics, /_factory/events, /_factory/live) is
+# served on 8080 from the start.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -18,7 +27,9 @@ spec:
   activeDeadlineSeconds: 7200
   template:
     metadata:
-      annotations: # for any Prometheus that discovers pods by annotation
+      annotations:
+        kubectl.kubernetes.io/default-container: factory # kubectl logs and exec mean the factory
+        # for any Prometheus that discovers pods by annotation:
         prometheus.io/scrape: "true"
         prometheus.io/port: "8080"
         prometheus.io/path: /metrics
@@ -28,23 +39,48 @@ spec:
         reversible/network: __NETWORK__
     spec:
       restartPolicy: Never
-      automountServiceAccountToken: false # model-written code runs here: no cluster credentials
+      automountServiceAccountToken: false # no cluster credentials anywhere in this pod
       enableServiceLinks: false
+      shareProcessNamespace: false # the default, stated: the sandbox must not see the factory's processes
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
         runAsGroup: 65532
         fsGroup: 65532
         seccompProfile: {type: RuntimeDefault}
-      containers:
-        - name: demo
+      initContainers:
+        - name: sandbox # a native sidecar: starts first, stops when the factory is done
           image: reversible:dev
-          imagePullPolicy: Never # loaded into kind by run.sh
+          imagePullPolicy: Never
+          restartPolicy: Always
+          args: ["runner", "-addr", "127.0.0.1:7070", "-root", "/shared"]
+          env:
+            - {name: TMPDIR, value: /shared}
+          startupProbe:
+            exec: {command: ["wget", "-q", "-O", "/dev/null", "http://127.0.0.1:7070/healthz"]}
+            periodSeconds: 1
+            failureThreshold: 30
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          resources:
+            requests: {cpu: 250m, memory: 256Mi}
+            limits: {cpu: "1", memory: 1Gi, ephemeral-storage: 1Gi}
+          volumeMounts:
+            - {name: shared, mountPath: /shared}
+      containers:
+        - name: factory
+          image: reversible:dev
+          imagePullPolicy: Never
           args: ["__DEMO__", "-keep", "-serve", ":8080"]
           envFrom:
             - __ENVKIND__:
                 name: __ENVNAME__
           env:
+            - {name: REVERSIBLE_RUNNER, value: "http://127.0.0.1:7070"}
+            - {name: TMPDIR, value: /shared} # builds and data live where the sandbox can run them
+            - {name: ANTHROPIC_BASE_URL, value: "__GATEWAY_URL__"}
             - {name: REVERSIBLE_MODEL, value: "__MODEL__"}
             - {name: REVERSIBLE_MAX_TOKENS, value: "__MAXTOKENS__"}
           ports:
@@ -61,9 +97,9 @@ spec:
             limits: {cpu: "2", memory: 2Gi, ephemeral-storage: 4Gi}
           volumeMounts:
             - {name: work, mountPath: /work}
-            - {name: tmp, mountPath: /tmp}
+            - {name: shared, mountPath: /shared}
       volumes:
-        - name: work # HOME and the Go build cache
+        - name: work # the factory's own: HOME and the Go build cache
           emptyDir: {sizeLimit: 2Gi}
-        - name: tmp # builds, generated code and production data
+        - name: shared # builds, generated code and production data, shared with the sandbox
           emptyDir: {sizeLimit: 2Gi}

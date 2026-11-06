@@ -19,7 +19,7 @@ The domains are examples. The incident tracker and the feature-flag service come
 ## What you need
 
 - Docker, [kind](https://kind.sigs.k8s.io/) and kubectl. About 4 GB of free memory and a few GB of disk.
-- For live runs, an Anthropic API key. Use one made for this, with a low spending limit, and revoke it when you're done experimenting (the architecture doc's [trust boundaries](ARCHITECTURE.md#trust-boundaries) say why).
+- For live runs, an Anthropic API key. The key stays in the model gateway, never in the pod where model-written code runs, and each run has a hard budget. Even so, a key made for this, with its own spending limit, is good practice ([trust boundaries](ARCHITECTURE.md#trust-boundaries)).
 - Nothing else. The image carries the Go toolchain the factory builds generated code with.
 
 ## Quick start
@@ -41,12 +41,14 @@ Each rung tests one more thing than the last. Don't skip `check`.
 |---|---|---|---|
 | 1. Offline | `run.sh offline` (or `offline factory`) | The loop works end to end in the cluster, with the deterministic generator and no network at all | None |
 | 2. Isolation | `run.sh check` | Offline pods reach nothing; live pods reach the Anthropic API and not the cluster | None |
-| 3. Rehearsal | `run.sh rehearse` | The live path works: config reaches the pod, requests go out and come back (one is refused as overloaded and retried), replies are parsed, and the code in them is built and run inside the locked-down pod. A stand-in API (`cmd/fakeclaude`) writes the generator's code | None |
-| 4. Key | `run.sh key` | Stores your key in a Secret. Input is hidden; the key goes through stdin, never an argument or a file. Only live pods read it | None |
+| 3. Rehearsal | `run.sh rehearse` | The live path works end to end. The run token reaches the pod. Requests go through the model gateway and come back (one is refused as overloaded and retried). Replies are parsed, and the code in them is built by the factory and run in the sandbox. Afterwards, the sandbox is checked for visible credentials. A stand-in API (`cmd/fakeclaude`) writes the generator's code | None |
+| 4. Key | `run.sh key` | Stores your key in a Secret that only the model gateway reads. Input is hidden; the key goes through stdin, never an argument or a file | None |
 | 5. Live | `run.sh live` | Claude writes every version of the incident tracker's code from the intent; the examples, the review and the canary decide whether each ships | 3–9 model calls |
 | 6. Live, from conversation | `run.sh live factory` | Claude drafts the feature-flag specs from conversation and writes the code | 5–12 model calls |
 
 `live` explains what it's about to do and asks before starting (`YES=1` skips the prompt). Choose a model with `REVERSIBLE_MODEL=claude-opus-5-5 deploy/kind/run.sh live`; the default is `claude-sonnet-5-5`.
+
+Every rehearse and live run gets a fresh token and a budget at the model gateway: 15 successful calls and 150,000 output tokens by default, enough for either demo with every repair attempt. Change it per run with `GATEWAY_MAX_CALLS=6 GATEWAY_MAX_OUTPUT_TOKENS=40000 deploy/kind/run.sh live`. A spent budget stops the run, with the build in progress failing on a `budget is spent` error; failed and refused calls don't count. When a rehearse or live run is serving, `run.sh` reports `Sandbox checked: generated code can't see the factory's processes or its run token`. If it ever prints a WARNING instead, stop and don't run live.
 
 ## Reading the story
 
@@ -158,7 +160,7 @@ Every refusal's `error` message comes from the intent, including the `why` the o
 
 Two habits worth having. Read `/why` before `/code`: the point of the system is that the decisions explain the software. And after using the service yourself, check `/traffic`, where your requests sit beside the scripted ones, attributed to the version that served them.
 
-For the files themselves: `kubectl --context kind-reversible -n reversible exec -it job/incidents-offline -- sh`, then `ls /tmp/incidents-demo-*/` (`builds/<spec hash>/main.go` for each version of the code, `production/` for the data and its per-release snapshots).
+For the files themselves: `kubectl --context kind-reversible -n reversible exec -it job/incidents-offline -c factory -- sh`, then `ls /shared/incidents-demo-*/` (`builds/<spec hash>/main.go` for each version of the code, `production/` for the data and its per-release snapshots).
 
 ## Watching it from outside
 
@@ -187,6 +189,8 @@ The Grafana home page is the dashboard *Software built from intent*. It follows 
 | Review: behaviour changes | `explained: no` above zero means a release was blocked |
 | Findings from production | Which callers were surprised by a new version |
 | Model calls, Model tokens | A live run's cost as it happens |
+| Gateway budget remaining, Gateway requests | What's left of the run's budget; `unauthorized` above zero means something other than this run's factory tried to use the gateway |
+| Where generated code ran | In kind, everything under `sandbox` |
 
 Every metric and event is listed in [ARCHITECTURE.md](ARCHITECTURE.md#telemetry). Outside kind, any demo run with `-serve :8080` serves the same telemetry; set `REVERSIBLE_EVENTS=events.jsonl` to also keep every event in a file.
 
@@ -249,7 +253,9 @@ The demos' traffic, conversations and scripted answers are written for their spe
 | `check` fails | Network rules not enforced (Calico not running) | `kubectl --context kind-reversible -n kube-system get pods -l k8s-app=calico-node`; if the cluster predates the Calico change, `run.sh down` then `up`. Don't run live until `check` passes |
 | Pod stuck `Pending` | Not enough memory or CPU for the requests (500m, 512Mi) | Free resources, or check `kubectl describe pod` |
 | `ErrImageNeverPull` | Image not loaded into kind | `run.sh image` |
-| Live run: `authentication_error` | Wrong or revoked key | `run.sh key` again |
+| Live run: `authentication_error` | Wrong or revoked key (the gateway passes the API's answer through), or a stale run token (the gateway was reconfigured mid-run) | `run.sh key` again, then rerun |
+| `permission_error: this run's budget is spent` | The run used its calls or output tokens | Rerun with a larger `GATEWAY_MAX_CALLS` / `GATEWAY_MAX_OUTPUT_TOKENS`, after checking why (attempts per build, in the story) |
+| Live run: `upstream unreachable` | The gateway can't reach the API (network, or Calico not ready) | `run.sh check`; `kubectl --context kind-reversible -n reversible logs deploy/model-gateway` |
 | Live run: repeated `(retrying)` then failure | Rate limits or overload | Wait and rerun; fewer concurrent uses of the key |
 | Live run: `reply cut off at max_tokens` | The generated service needs a longer reply | Rerun with more room: `REVERSIBLE_MAX_TOKENS=32000 deploy/kind/run.sh live` (default 16000) |
 | Story ends with `ended (Failed) before serving` | A step couldn't produce its evidence (no passing build, unexplained changes, an error) | The story above it says which; `run.sh logs` reprints it |
@@ -260,7 +266,7 @@ The demos' traffic, conversations and scripted answers are written for their spe
 ## Cleaning up
 
 ```sh
-deploy/kind/run.sh forget-key   # delete the key from the cluster
+deploy/kind/run.sh forget-key   # delete the key, and restart the gateway without it
 deploy/kind/run.sh down         # delete the cluster, and everything in it
 ```
 
@@ -272,17 +278,17 @@ Then revoke the key in the Anthropic Console if you made it for this.
 
 | Command | Does |
 |---|---|
-| `up` | Create the cluster (with Calico), build and load the image, apply the namespace, network rules and rehearsal stand-in |
+| `up` | Create the cluster (with Calico), build and load the image, apply the namespace, network rules, model gateway and rehearsal stand-in |
 | `image` | Rebuild and reload the image (after changing code or intent) |
-| `check` | Prove the network rules are enforced |
+| `check` | Prove the network rules are enforced: offline pods reach nothing, demo pods only the gateway, the gateway only the API |
 | `offline [incidents\|factory]` | Run a demo with the deterministic generator, no network |
-| `rehearse` | Run the incident tracker through the live path against the stand-in API |
-| `key` | Store the API key (prompted, hidden; or from `ANTHROPIC_API_KEY`) |
+| `rehearse` | Run the incident tracker through the live path (gateway, sandbox) against the stand-in API |
+| `key` | Store the API key for the model gateway (prompted, hidden; or from `ANTHROPIC_API_KEY`) |
 | `live [incidents\|factory]` | Run a demo with Claude |
 | `open` | Port-forward the running demo to `localhost:${LOCAL_PORT:-8080}` (works from the start of a run, for telemetry) |
 | `observe` | Add Prometheus and Grafana (namespace `observe`), scraping the demo |
 | `dashboards` | Port-forward Grafana to `localhost:3000` and Prometheus to `localhost:9090` |
-| `logs`, `status` | The current run's story; what's running and whether a key is stored |
+| `logs`, `status` | The current run's story; what's running, whether a key is stored, and the gateway's last log lines (budget used) |
 | `forget-key`, `down` | Remove the key; delete the cluster |
 
 Environment variables:
@@ -293,7 +299,8 @@ Environment variables:
 | `LOCAL_PORT` | `run.sh open` | `8080` |
 | `YES=1` | `run.sh live` | Asks first |
 | `ANTHROPIC_API_KEY` | `run.sh key`, and the demos when run outside kind | Prompted |
-| `ANTHROPIC_BASE_URL` | The demos (the rehearsal points it at the stand-in) | `https://api.anthropic.com` |
+| `GATEWAY_MAX_CALLS`, `GATEWAY_MAX_OUTPUT_TOKENS` | `run.sh rehearse` and `live`: the run's budget at the gateway | `15`, `150000` |
+| `ANTHROPIC_BASE_URL` | The demos (in kind, set to the gateway's address) | `https://api.anthropic.com` |
 | `REVERSIBLE_EVENTS` | The demos: also write every event as a JSON line to `stderr` or a file | Off |
 | `STORY_TIMEOUT` | `run.sh`: how long to stream a story before giving up, in seconds | `2700` |
 

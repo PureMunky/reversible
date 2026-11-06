@@ -30,7 +30,7 @@ This is the part to understand before running the factory live.
 
 - **Model-written Go is compiled and executed** (`factory/build.go`): written to a temporary directory, built with `go build` (standard library only, `CGO_ENABLED=0`, no module downloads), and run as its own process listening on `127.0.0.1` on a random port.
 - **It runs with your user's permissions.** The gate checks *behaviour*: it runs the examples against the process and compares responses. It does not inspect what the code does besides answering requests. A generated program could read files or open network connections, and the examples would never notice.
-- **So run the factory live in a container or VM**, not on your workstation directly. The kind environment does this for you, with the key in a Secret, no cluster credentials, a read-only root and limited egress, and a free rehearsal of the whole path first: see [USER-GUIDE.md](USER-GUIDE.md) and, for what it does and doesn't contain, [ARCHITECTURE.md](ARCHITECTURE.md#trust-boundaries). Or, with plain Docker:
+- **So run the factory live in a container or VM**, not on your workstation directly. The kind environment does this for you: the key stays in a model gateway that enforces a per-run budget, generated code runs in a sandbox container that can't see the factory or any credential, the pod running it has no route out but the gateway, and the whole path can be rehearsed first for free: see [USER-GUIDE.md](USER-GUIDE.md) and, for what it does and doesn't contain, [ARCHITECTURE.md](ARCHITECTURE.md#trust-boundaries). Or, with plain Docker:
 
   ```sh
   docker run --rm -it -v "$PWD":/src -w /src \

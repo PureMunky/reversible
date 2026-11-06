@@ -1,14 +1,16 @@
 # The namespace the demos run in, and what may talk to what.
 #
-# Model-written code is compiled and run inside the demo pod, so the pod
-# gets the least the run needs: no Kubernetes API credentials, a read-only
-# root filesystem, no capabilities, and a network that depends on the mode:
-#   offline    no network at all
-#   rehearsal  only the fakeclaude stand-in, in this namespace
-#   live       DNS, and HTTPS (443) to public addresses only: not the
-#              cluster, the node, or your private networks
-# NetworkPolicy can't restrict by hostname, so live is "public 443", not
-# "api.anthropic.com only". See docs/ARCHITECTURE.md.
+# Model-written code runs in the demo pod (in its own container: see
+# demo-job.yaml), so that pod holds no API key and has no route out:
+#
+#   demo pod, offline       no network at all
+#   demo pod, rehearse/live only the model gateway, on 8080; not even DNS
+#                           (run.sh gives it the gateway's address)
+#   model gateway           holds the key; DNS, public HTTPS (443) and the
+#                           rehearsal stand-in; nothing private
+#   fakeclaude              reachable only from the gateway
+#
+# `run.sh check` proves all of this on the running cluster.
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -29,12 +31,30 @@ spec:
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: live-egress
+  name: demo-to-gateway-only
   namespace: reversible
 spec:
   podSelector:
     matchLabels:
-      reversible/network: live
+      reversible/network: model
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              reversible/network: gateway
+      ports:
+        - {protocol: TCP, port: 8080}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: gateway-egress
+  namespace: reversible
+spec:
+  podSelector:
+    matchLabels:
+      reversible/network: gateway
   policyTypes: [Egress]
   egress:
     - to:
@@ -53,32 +73,34 @@ spec:
             except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 100.64.0.0/10]
       ports:
         - {protocol: TCP, port: 443}
----
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata:
-  name: rehearsal-egress
-  namespace: reversible
-spec:
-  podSelector:
-    matchLabels:
-      reversible/network: rehearsal
-  policyTypes: [Egress]
-  egress:
-    - to:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: kube-system
-          podSelector:
-            matchLabels:
-              k8s-app: kube-dns
-      ports:
-        - {protocol: UDP, port: 53}
-        - {protocol: TCP, port: 53}
     - to:
         - podSelector:
             matchLabels:
               app.kubernetes.io/name: fakeclaude
+      ports:
+        - {protocol: TCP, port: 8080}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: gateway-ingress
+  namespace: reversible
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: model-gateway
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              reversible/network: model
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observe
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prometheus
       ports:
         - {protocol: TCP, port: 8080}
 ---
@@ -96,12 +118,12 @@ spec:
     - from:
         - podSelector:
             matchLabels:
-              reversible/network: rehearsal
+              reversible/network: gateway
       ports:
         - {protocol: TCP, port: 8080}
 ---
 # Reached with `kubectl port-forward`, which doesn't pass through
-# NetworkPolicy; nothing in the cluster can reach the demo.
+# NetworkPolicy; inside the cluster only Prometheus may reach the demo.
 apiVersion: v1
 kind: Service
 metadata:
@@ -112,3 +134,11 @@ spec:
     app.kubernetes.io/name: reversible-demo
   ports:
     - {name: http, port: 8080, targetPort: 8080}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: offline
+  namespace: reversible
+data:
+  REVERSIBLE_MODE: offline

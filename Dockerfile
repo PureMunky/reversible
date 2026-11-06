@@ -5,7 +5,7 @@ FROM golang:1.24-alpine AS build
 WORKDIR /src
 COPY go.mod ./
 COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -o /out/ ./cmd/factory ./cmd/incidents ./cmd/fakeclaude ./cmd/designer ./cmd/reach
+RUN CGO_ENABLED=0 go build -trimpath -o /out/ ./cmd/factory ./cmd/incidents ./cmd/fakeclaude ./cmd/designer ./cmd/reach ./cmd/runner ./cmd/modelgateway
 
 FROM golang:1.24-alpine
 COPY --from=build /out/ /usr/local/bin/

@@ -28,6 +28,7 @@ var (
 	mCanary     = tel.Gauge("reversible_canary_version", "1 for a version running as a canary.", "service", "version")
 	mReleases   = tel.Counter("reversible_releases_total", "Changes to what's live: release, promote, rollback (a rewind put an earlier version back), stop.", "service", "action")
 	mCanaryEval = tel.Counter("reversible_canary_evaluations_total", "Canary evaluations by result: running, promoted, stopped.", "service", "result")
+	mStarts     = tel.Counter("reversible_service_starts_total", "Generated service processes started, by where: sandbox (by the runner, apart from the factory) or local (as the factory's own child, outside kind).", "where")
 	mFindings   = tel.Counter("reversible_findings_total", "Production findings (new refusals, server errors) by kind and caller.", "service", "kind", "caller")
 )
 

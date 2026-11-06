@@ -103,9 +103,9 @@ jobs:
           shellcheck deploy/kind/run.sh
           curl -sSL https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz | tar -xz -C "$RUNNER_TEMP"
           d="$RUNNER_TEMP/rendered"; mkdir -p "$d"
-          sed -e s/__NAME__/x/ -e s/__MODE__/live/ -e s/__NETWORK__/live/ -e s/__DEMO__/incidents/ -e s/__ENVKIND__/secretRef/ -e s/__ENVNAME__/anthropic/ -e s/__MODEL__// -e s/__MAXTOKENS__// deploy/kind/manifests/demo-job.yaml > "$d/job.yaml"
-          sed s/__NETWORK__/none/ deploy/kind/manifests/isolation-check.yaml > "$d/iso.yaml"
-          cp deploy/kind/manifests/base.yaml deploy/kind/manifests/fakeclaude.yaml deploy/kind/manifests/observe.yaml "$d/"
+          sed -e s/__NAME__/x/ -e s/__MODE__/live/ -e s/__NETWORK__/model/ -e s/__DEMO__/incidents/ -e s/__ENVKIND__/secretRef/ -e s/__ENVNAME__/gateway-token/ -e s/__MODEL__// -e s/__MAXTOKENS__// -e 's#__GATEWAY_URL__#http://10.96.0.5:8080#' deploy/kind/manifests/demo-job.yaml > "$d/job.yaml"
+          sed -e s/__NETWORK__/model/ -e s/__GATEWAY_IP__/10.96.0.5/ -e s/__K8S_IP__/10.96.0.1/ -e s/__DNS_IP__/10.96.0.10/ deploy/kind/manifests/isolation-check.yaml > "$d/iso.yaml"
+          cp deploy/kind/manifests/base.yaml deploy/kind/manifests/fakeclaude.yaml deploy/kind/manifests/gateway.yaml deploy/kind/manifests/observe.yaml "$d/"
           python3 -c "import json; json.load(open('deploy/kind/observe/dashboard.json'))"
           "$RUNNER_TEMP/kubeconform" -strict -summary "$d"/*.yaml
       - name: install kind
@@ -115,7 +115,12 @@ jobs:
       - name: up
         run: deploy/kind/run.sh up
       - name: network rules are enforced
-        run: deploy/kind/run.sh check | tee check.txt && grep -q "Network rules enforced" check.txt
+        run: |
+          deploy/kind/run.sh check | tee check.txt
+          grep -q "an offline demo pod reaches nothing" check.txt
+          grep -q "reaches the model gateway and nothing else" check.txt
+          grep -q "the model gateway reaches the Anthropic API, and not the cluster API" check.txt
+          grep -q "Network rules enforced" check.txt
       - name: observability
         run: deploy/kind/run.sh observe
       - name: offline run, then use and inspect it
@@ -155,6 +160,15 @@ jobs:
           grep -q "overloaded_error: rehearsal: overloaded (retrying)" rehearse.txt
           grep -q "27/27 examples pass" rehearse.txt
           grep -q "It's serving" rehearse.txt
+          grep -q "Sandbox checked: generated code can't see" rehearse.txt
+          kubectl --context kind-reversible -n reversible logs deploy/model-gateway | tee gw.txt
+          grep -q "forwarded: .*budget used: 3/15 calls" gw.txt
+          # every generated service ran in the sandbox, none in the factory container
+          kubectl --context kind-reversible -n reversible exec job/incidents-rehearsal -c factory -- sh -c '! grep -qs "builds/[0-9a-f][0-9a-f]*/service" /proc/[0-9]*/cmdline'
+          kubectl --context kind-reversible -n reversible exec job/incidents-rehearsal -c sandbox -- sh -c 'grep -qs "builds/[0-9a-f][0-9a-f]*/service" /proc/[0-9]*/cmdline'
+          kubectl --context kind-reversible -n reversible exec job/incidents-rehearsal -c factory -- wget -qO- http://127.0.0.1:8080/metrics > rmetrics.txt
+          grep -q 'reversible_service_starts_total{where="sandbox"}' rmetrics.txt
+          (! grep -q 'reversible_service_starts_total{where="local"}' rmetrics.txt)
       - name: diagnostics
         if: failure()
         run: |
@@ -162,4 +176,5 @@ jobs:
           kubectl --context kind-reversible -n observe get all || true
           kubectl --context kind-reversible -n observe logs --tail=50 deploy/grafana || true
           kubectl --context kind-reversible -n reversible describe pods || true
-          kubectl --context kind-reversible -n reversible logs --tail=200 -l app.kubernetes.io/name=reversible-demo || true
+          kubectl --context kind-reversible -n reversible logs --tail=200 --all-containers -l app.kubernetes.io/name=reversible-demo || true
+          kubectl --context kind-reversible -n reversible logs --tail=50 deploy/model-gateway || true

@@ -72,12 +72,33 @@ func keep(names []string) []string {
 
 // Instance is a running generated service.
 type Instance struct {
-	URL string
-	cmd *exec.Cmd
+	URL  string
+	cmd  *exec.Cmd
+	stop func() // set when a runner started it
 }
 
 // Start runs a built service. dataPath is its persistent state ("" for none).
+//
+// With REVERSIBLE_RUNNER set (e.g. http://127.0.0.1:7070), the service is
+// started by a runner (cmd/runner) instead of as this process's child. In
+// kind the runner is a separate container: model-written code then runs
+// where it can't see the factory's processes, environment or credentials.
 func Start(ctx context.Context, binary, dataPath string) (*Instance, error) {
+	if runner := os.Getenv("REVERSIBLE_RUNNER"); runner != "" {
+		inst, err := startRemote(ctx, runner, binary, dataPath)
+		if err == nil {
+			mStarts.Inc("sandbox")
+		}
+		return inst, err
+	}
+	inst, err := startLocal(ctx, binary, dataPath)
+	if err == nil {
+		mStarts.Inc("local")
+	}
+	return inst, err
+}
+
+func startLocal(ctx context.Context, binary, dataPath string) (*Instance, error) {
 	cmd := exec.Command(binary)
 	cmd.Env = append(serviceEnv(), "ADDR=127.0.0.1:0", "DATA="+dataPath)
 	stdout, err := cmd.StdoutPipe()
@@ -119,7 +140,14 @@ func Start(ctx context.Context, binary, dataPath string) (*Instance, error) {
 
 // Stop shuts the service down.
 func (i *Instance) Stop() {
-	if i == nil || i.cmd == nil || i.cmd.Process == nil {
+	if i == nil {
+		return
+	}
+	if i.stop != nil {
+		i.stop()
+		return
+	}
+	if i.cmd == nil || i.cmd.Process == nil {
 		return
 	}
 	i.cmd.Process.Kill()

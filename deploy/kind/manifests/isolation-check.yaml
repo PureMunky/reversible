@@ -1,13 +1,15 @@
 # Proves the network rules are enforced on this cluster, rather than
-# assuming it: an offline pod must not reach anything (not even DNS), a
-# live pod must reach the Anthropic API but not the Kubernetes API.
+# assuming it. Each pod wears the labels of what it checks and tries to
+# connect (cmd/reach, a TCP connect check) to what it must and mustn't
+# reach. Addresses are IPs where DNS isn't the point. run.sh renders one
+# pod per network (none, model, gateway), filling in __NETWORK__,
+# __GATEWAY_IP__, __K8S_IP__ and __DNS_IP__.
 apiVersion: v1
 kind: Pod
 metadata:
   name: isolation-__NETWORK__
   namespace: reversible
-  labels:
-    reversible/network: __NETWORK__
+  labels: {reversible/network: __NETWORK__}
 spec:
   restartPolicy: Never
   automountServiceAccountToken: false
@@ -21,21 +23,24 @@ spec:
     - name: check
       image: reversible:dev
       imagePullPolicy: Never
-      command: ["sh", "-c"] # reach: cmd/reach, a TCP connect check
+      command: ["sh", "-c"]
+      env:
+        - name: CHECK # which check: this pod's own network label
+          valueFrom: {fieldRef: {fieldPath: "metadata.labels['reversible/network']"}}
       args:
         - |
-          k8s=kubernetes.default.svc.cluster.local:443
-          api=api.anthropic.com:443
-          case "__NETWORK__" in
-            none)
-              for a in $api $k8s example.com:443; do
-                if reach $a; then echo "FAIL: an offline pod reached $a"; exit 1; fi
-              done
-              echo "ok: an offline pod reaches nothing";;
-            live)
-              reach $api || { echo "FAIL: a live pod can't reach the Anthropic API"; exit 1; }
-              if reach $k8s; then echo "FAIL: a live pod reached the Kubernetes API"; exit 1; fi
-              echo "ok: a live pod reaches the Anthropic API, and not the cluster";;
+          gw=__GATEWAY_IP__:8080 k8s=__K8S_IP__:443 dns=__DNS_IP__:53
+          must() { reach "$@" || { echo "FAIL: $CHECK pod can't reach $*"; exit 1; }; }
+          mustnt() { for a in "$@"; do if reach "$a" >/dev/null; then echo "FAIL: $CHECK pod reached $a"; exit 1; fi; done; }
+          case $CHECK in
+            none)    mustnt $gw $k8s $dns 1.1.1.1:443 api.anthropic.com:443
+                     echo "ok: an offline demo pod reaches nothing";;
+            model)   must $gw >/dev/null
+                     mustnt $k8s $dns 1.1.1.1:443 api.anthropic.com:443
+                     echo "ok: a rehearse/live demo pod reaches the model gateway and nothing else (no internet, no DNS, no cluster API)";;
+            gateway) must api.anthropic.com:443 >/dev/null
+                     mustnt $k8s
+                     echo "ok: the model gateway reaches the Anthropic API, and not the cluster API";;
           esac
       securityContext:
         allowPrivilegeEscalation: false
