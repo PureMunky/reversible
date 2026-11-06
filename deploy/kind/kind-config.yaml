@@ -1,8 +1,14 @@
-# One node is enough: the demos are a single pod each. kind's default CNI
-# (kindnet) enforces NetworkPolicy from kind v0.24, which the isolation
-# below depends on; `run.sh check` proves it on your cluster.
+# One node is enough: the demos are a single pod each.
+#
+# kind's default CNI (kindnet) does not enforce NetworkPolicy (CI found
+# this: an "offline" pod reached the internet), and the isolation of
+# model-written code depends on it. So the default CNI is off and run.sh
+# installs Calico, which enforces it; `run.sh check` proves it does.
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 name: reversible
+networking:
+  disableDefaultCNI: true
+  podSubnet: 192.168.0.0/16 # Calico's default pool
 nodes:
   - role: control-plane

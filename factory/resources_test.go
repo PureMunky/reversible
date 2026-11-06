@@ -209,3 +209,15 @@ func TestRouterForwardsFilters(t *testing.T) {
 		t.Fatalf("recorded path %q: replay would lose the filter", p)
 	}
 }
+
+func TestGeneratedCodeDoesNotSeeSecrets(t *testing.T) {
+	t.Setenv("ANTHROPIC_API_KEY", "sk-secret")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "also-secret")
+	for name, env := range map[string][]string{"build": buildEnv(), "service": serviceEnv()} {
+		for _, kv := range env {
+			if strings.Contains(kv, "secret") {
+				t.Errorf("%s environment carries %q", name, kv)
+			}
+		}
+	}
+}

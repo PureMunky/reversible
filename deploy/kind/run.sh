@@ -20,6 +20,7 @@ root="$(cd "$here/../.." && pwd)"
 cluster=reversible
 ns=reversible
 ctx="kind-$cluster"
+calico=https://raw.githubusercontent.com/projectcalico/calico/v3.28.2/manifests/calico.yaml
 k() { kubectl --context "$ctx" -n "$ns" "$@"; }
 
 need() {
@@ -40,6 +41,11 @@ up() {
   if ! kind get clusters 2>/dev/null | grep -qx "$cluster"; then
     kind create cluster --config "$here/kind-config.yaml"
   fi
+  # Calico in place of kindnet, so NetworkPolicy is enforced (kind-config.yaml says why).
+  echo "── installing Calico (enforces the network rules)"
+  kubectl --context "$ctx" apply -f "$calico" >/dev/null
+  kubectl --context "$ctx" -n kube-system rollout status daemonset/calico-node --timeout=300s
+  kubectl --context "$ctx" wait --for=condition=Ready nodes --all --timeout=300s
   image
   kubectl --context "$ctx" apply -f "$here/manifests/base.yaml"
   kubectl --context "$ctx" apply -f "$here/manifests/fakeclaude.yaml"
@@ -61,7 +67,7 @@ check() {
   done
   if [ $ok -ne 0 ]; then
     echo "The network rules aren't behaving as intended on this cluster. Don't run live until they are" >&2
-    echo "(kind v0.24 or later enforces NetworkPolicy with its default CNI: kind version)." >&2
+    echo "(This cluster needs Calico, which run.sh up installs: kubectl --context $ctx -n kube-system get pods -l k8s-app=calico-node)" >&2
     exit 1
   fi
   echo "Network rules enforced."

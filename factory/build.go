@@ -40,12 +40,34 @@ func compile(ctx context.Context, dir string, files map[string]string) (string, 
 	bin := filepath.Join(dir, "service")
 	cmd := exec.CommandContext(ctx, "go", "build", "-o", bin, ".")
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "GOTOOLCHAIN=local", "CGO_ENABLED=0", "GOFLAGS=-mod=mod")
+	cmd.Env = append(buildEnv(), "GOTOOLCHAIN=local", "CGO_ENABLED=0", "GOFLAGS=-mod=mod")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return "", fmt.Errorf("build failed:\n%s", strings.TrimSpace(string(out)))
 	}
 	return bin, nil
+}
+
+// Generated code may be written by a model, so nothing it is built or run
+// with may carry the factory's secrets (ANTHROPIC_API_KEY above all): the
+// toolchain gets only what a Go build needs, and the service only where
+// to listen, where its data is, and a temp dir. This narrows exposure; it
+// isn't a sandbox (the service still runs as the factory's user; see
+// docs/ARCHITECTURE.md, "Trust boundaries").
+var buildVars = []string{"PATH", "HOME", "TMPDIR", "GOROOT", "GOPATH", "GOCACHE", "GOTMPDIR", "GOPROXY", "GOTELEMETRY"}
+
+func buildEnv() []string { return keep(buildVars) }
+
+func serviceEnv() []string { return keep([]string{"TMPDIR"}) }
+
+func keep(names []string) []string {
+	var env []string
+	for _, n := range names {
+		if v, ok := os.LookupEnv(n); ok {
+			env = append(env, n+"="+v)
+		}
+	}
+	return env
 }
 
 // Instance is a running generated service.
@@ -57,7 +79,7 @@ type Instance struct {
 // Start runs a built service. dataPath is its persistent state ("" for none).
 func Start(ctx context.Context, binary, dataPath string) (*Instance, error) {
 	cmd := exec.Command(binary)
-	cmd.Env = append(os.Environ(), "ADDR=127.0.0.1:0", "DATA="+dataPath)
+	cmd.Env = append(serviceEnv(), "ADDR=127.0.0.1:0", "DATA="+dataPath)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, err
