@@ -1,2 +1,4 @@
 /.reversible/
 /agentctl
+# demo output written by CI steps
+/*.txt
